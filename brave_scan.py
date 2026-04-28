@@ -20,6 +20,7 @@ Output layout:
             screenshot.png
             page.html
             lighthouse.json     raw Lighthouse report (if available)
+            brave_lighthouse.png      extracted Lighthouse full-page screenshot (best effort)
 
 Prerequisites:
     pip install playwright pytest-playwright
@@ -40,6 +41,7 @@ Notes:
 
 import argparse
 import asyncio
+import base64
 import json
 import re
 import shutil
@@ -88,6 +90,7 @@ LAUNCH_ARGS = [
     "--disable-sync",
     "--enable-features=BraveAdblockDefault2Lists,BraveAdblockCosmeticFiltering",
     "--remote-debugging-port=9222",  # needed for Lighthouse to connect
+    "--window-size=1920,1040",  # total window fits on a 1920x1080 screen (1080 - 40px taskbar)
 ]
 
 IGNORE_DEFAULT_ARGS = [
@@ -98,8 +101,8 @@ IGNORE_DEFAULT_ARGS = [
 ]
 
 # Default WAVE stats returned when injection fails
-_WAVE_EMPTY = {"error": -1, "contrast": -1, "alert": -1,
-               "feature": -1, "structure": -1, "aria": -1}
+_WAVE_EMPTY = {"error": None, "contrast": None, "alert": None,
+               "feature": None, "structure": None, "aria": None}
 _WAVE_ZERO  = {"error": 0,  "contrast": 0,  "alert": 0,
                "feature": 0,  "structure": 0,  "aria": 0}
 
@@ -255,7 +258,7 @@ async def launch_brave(playwright) -> tuple[BrowserContext, Page]:
         args=LAUNCH_ARGS,
         ignore_default_args=IGNORE_DEFAULT_ARGS,
         bypass_csp=True,
-        viewport={"width": 1920, "height": 1080},
+        viewport={"width": 1920, "height": 969},
     )
     page = await context.new_page()
     return context, page
@@ -316,7 +319,11 @@ async def run_wave(page: Page, output_path: Path | None = None) -> dict:
 
 # ── Lighthouse ─────────────────────────────────────────────────────────────────
 
-async def run_lighthouse(url: str, output_path: Path) -> float | None:
+async def run_lighthouse(
+    url: str,
+    output_path: Path,
+    screenshot_file: Path | None = None,
+) -> float | None:
     """
     Run a Lighthouse accessibility audit against the already-open Brave instance
     (which is listening on --remote-debugging-port=9222).
@@ -324,7 +331,7 @@ async def run_lighthouse(url: str, output_path: Path) -> float | None:
     Lighthouse is invoked as a Node subprocess so it attaches to the live page
     rather than opening a new browser, preserving any auth state or cookies.
 
-    Returns the accessibility score (0–100) or None if Lighthouse is unavailable.
+    Returns the accessibility score (0-100) or None if Lighthouse is unavailable.
     """
     lh_json = output_path / "lighthouse.json"
 
@@ -352,6 +359,50 @@ async def run_lighthouse(url: str, output_path: Path) -> float | None:
             score  = report.get("categories", {}).get("accessibility", {}).get("score")
             if score is not None:
                 score = round(score * 100, 1)  # Lighthouse returns 0.0–1.0
+
+            # Extract and save the full-page screenshot embedded in the report.
+            try:
+                # Lighthouse report shape differs by version:
+                # - Newer: report["fullPageScreenshot"]["screenshot"]["data"]
+                # - Older: report["audits"]["full-page-screenshot"]["details"]["screenshot"]["data"]
+                ss_data = (
+                    report.get("fullPageScreenshot", {})
+                          .get("screenshot", {})
+                          .get("data", "")
+                )
+                if not ss_data:
+                    ss_data = (
+                        report.get("audits", {})
+                              .get("full-page-screenshot", {})
+                              .get("details", {})
+                              .get("screenshot", {})
+                              .get("data", "")
+                    )
+
+                if ss_data.startswith("data:"):
+                    header, b64 = ss_data.split(",", 1)
+                    ext = header.split(";")[0].split("/")[1]  # often 'webp' or 'png'
+                    ss_path = screenshot_file or (output_path / f"lighthouse_screenshot.{ext}")
+
+                    # If caller requests .png but Lighthouse provides another
+                    # format, try to convert with Pillow when available.
+                    if ss_path.suffix.lower() == ".png" and ext.lower() != "png":
+                        try:
+                            import io
+                            pil_image = __import__("PIL.Image", fromlist=["Image"])
+
+                            raw = base64.b64decode(b64)
+                            pil_image.open(io.BytesIO(raw)).save(ss_path, format="PNG")
+                        except Exception:
+                            ss_path = ss_path.with_suffix(f".{ext}")
+                            ss_path.write_bytes(base64.b64decode(b64))
+                    else:
+                        if not ss_path.suffix:
+                            ss_path = ss_path.with_suffix(f".{ext}")
+                        ss_path.write_bytes(base64.b64decode(b64))
+            except Exception:
+                pass  # screenshot extraction is best-effort
+
             print(f"       [+] Lighthouse accessibility score: {score}")
             return score
 
@@ -369,7 +420,7 @@ async def run_lighthouse(url: str, output_path: Path) -> float | None:
 
 async def capture_screenshot(page: Page, dest: Path) -> str | None:
     try:
-        await page.screenshot(path=str(dest), full_page=True)
+        await page.screenshot(path=str(dest), full_page=False)
         return str(dest)
     except Exception as e:
         print(f"       [!] Screenshot failed: {e}")
@@ -496,7 +547,11 @@ async def scan_url(
         # ── Lighthouse ────────────────────────────────────────────────────────
         if run_lighthouse_flag:
             print("       [*] Running Lighthouse accessibility audit...")
-            lh_score = await run_lighthouse(url, art_dir)
+            lh_score = await run_lighthouse(
+                url,
+                art_dir,
+                screenshot_file=art_dir / "brave_lighthouse.png",
+            )
             if lh_score is not None:
                 lighthouse_path = str(art_dir / "lighthouse.json")
 

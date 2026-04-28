@@ -27,10 +27,20 @@ from brave_scan import (
     launch_brave,
     load_urls,
 )
+import chrome_scan
 from chrome_scan import (
     chrome_process_url,
     init_db as chrome_init_db,
 )
+
+
+def get_scanned_urls(con, table: str) -> set[str]:
+    """Return the set of URLs already present in the given scan table."""
+    try:
+        rows = con.execute(f"SELECT DISTINCT url FROM {table}").fetchall()  # noqa: S608
+        return {row[0] for row in rows}
+    except Exception:
+        return set()
 
 
 async def main(
@@ -39,11 +49,13 @@ async def main(
     artifacts_root: Path,
     timeout: int,
     brave_dwell: int,
+    chrome_dwell: int,
     run_wave_flag: bool,
     run_lighthouse_flag: bool,
     run_nvda_flag: bool,
     run_brave: bool,
     run_chrome: bool,
+    resume: bool,
 ) -> None:
     urls = load_urls(csv_path)
     if not urls:
@@ -66,8 +78,13 @@ async def main(
     if run_chrome:
         chrome_con = chrome_init_db(db_path)
 
+    # Build per-scanner skip sets when resuming.
+    chrome_done: set[str] = get_scanned_urls(chrome_con, "chrome_scans") if (resume and run_chrome) else set()  # type: ignore[possibly-undefined]
+    brave_done: set[str] = get_scanned_urls(brave_con, "brave_scans") if (resume and run_brave) else set()  # type: ignore[possibly-undefined]
+
     chrome_shared = dict(
         timeout=timeout,
+        dwell=chrome_dwell,
         run_wave_flag=run_wave_flag,
         run_lighthouse_flag=run_lighthouse_flag,
         run_nvda_flag=run_nvda_flag,
@@ -79,6 +96,18 @@ async def main(
         run_lighthouse_flag=run_lighthouse_flag,
         run_nvda_flag=run_nvda_flag,
     )
+    if resume:
+        skipped_chrome = len(chrome_done) if run_chrome else 0
+        skipped_brave = len(brave_done) if run_brave else 0
+        remaining = [
+            u for u in urls
+            if (not run_chrome or u not in chrome_done)
+            or (not run_brave or u not in brave_done)
+        ]
+    else:
+        skipped_chrome = skipped_brave = 0
+        remaining = urls
+
     print(f"[!] Starting scans at {asyncio.get_event_loop().time():.2f} seconds.")
     print(f"\n{'='*60}")
     print(f"  Combined Scanner  ({len(urls)} URLs)")
@@ -86,24 +115,30 @@ async def main(
     print(f"  Input:       {csv_path}")
     print(f"  Database:    {db_path}")
     print(f"  Artifacts:   {artifacts_root}")
-    print(f"  Timeout:     {timeout}s  |  Brave dwell: {brave_dwell}s")
+    print(f"  Timeout:     {timeout}s  |  Brave dwell: {brave_dwell}s  |  Chrome dwell: {chrome_dwell}s")
     print(f"  WAVE:        {'yes' if run_wave_flag else 'no'}")
     print(f"  Lighthouse:  {'yes' if run_lighthouse_flag else 'no'}")
     print(f"  NVDA:        {'yes' if run_nvda_flag else 'no'}")
     print(f"  Brave scan:  {'yes' if run_brave else 'no'}")
-    print(f"  Chrome scan: {'yes' if run_chrome else 'no'}\n")
+    print(f"  Chrome scan: {'yes' if run_chrome else 'no'}")
+    print(f"  Resume:      {'yes' if resume else 'no'}")
+    if resume:
+        print(f"  Skipping:    {skipped_chrome} chrome / {skipped_brave} brave already-scanned URLs")
+    print(f"  Debug:       {'yes' if chrome_scan.DEBUG else 'no'}\n")
 
     async with async_playwright() as p:
         try:
-            for i, url in enumerate(urls, 1):
-                print(f"[{i}/{len(urls)}] {url}")
+            for i, url in enumerate(remaining, 1):
+                print(f"[{i}/{len(remaining)}] {url}")
 
-                if run_chrome:
+                if run_chrome and url not in chrome_done:
                     await chrome_process_url(
                         chrome_con, p, url, chrome_artifacts, **chrome_shared
                     )
+                elif run_chrome:
+                    print(f"  [chrome] skipping (already scanned)")
 
-                if run_brave:
+                if run_brave and url not in brave_done:
                     brave_context, _ = await launch_brave(p)
                     try:
                         await brave_process_url(
@@ -111,6 +146,8 @@ async def main(
                         )
                     finally:
                         await brave_context.close()
+                elif run_brave:
+                    print(f"  [brave]  skipping (already scanned)")
         finally:
             if run_brave:
                 brave_con.close()
@@ -136,6 +173,8 @@ if __name__ == "__main__":
                         help="Navigation timeout in seconds (default: 30)")
     parser.add_argument("--brave-dwell", type=int, default=60,
                         help="Seconds Brave dwells after page load (default: 60)")
+    parser.add_argument("--chrome-dwell", type=int, default=60,
+                        help="Seconds Chrome dwells after cookie acceptance (default: 60)")
     parser.add_argument("--no-wave",       action="store_true",
                         help="Skip WAVE accessibility injection")
     parser.add_argument("--no-lighthouse", action="store_true",
@@ -146,7 +185,14 @@ if __name__ == "__main__":
                         help="Run Brave scan only")
     parser.add_argument("--chrome-only", action="store_true",
                         help="Run Chrome scan only")
+    parser.add_argument("--debug",       action="store_true",
+                        help="Print verbose Chrome cookie-acceptance diagnostics")
+    parser.add_argument("--resume",      action="store_true",
+                        help="Resume a previous scan — skip URLs already in the database")
     args = parser.parse_args()
+
+    if args.debug:
+        chrome_scan.DEBUG = True
 
     if not args.csv.exists():
         print(f"[!] CSV file not found: {args.csv}")
@@ -158,18 +204,21 @@ if __name__ == "__main__":
 
     artifacts_root = args.artifacts or args.db.parent / "artifacts"
 
-    # Clean up any existing DB file to avoid confusion (since we append to the same tables).
-    if args.db.exists():
-        print(f"[!] Removing existing database file: {args.db}")
-        args.db.unlink()
-    # Clean up any existing artifacts directory to avoid confusion.
-    if artifacts_root.exists():
-        print(f"[!] Removing existing artifacts directory: {artifacts_root}")
-        for item in artifacts_root.iterdir():
-            if item.is_file():
-                item.unlink()
-            else:
-                shutil.rmtree(item)
+    if args.resume:
+        if not args.db.exists():
+            print(f"[!] --resume specified but no existing database found at {args.db} — starting fresh.")
+    else:
+        # Clean up any existing DB file to avoid confusion (since we append to the same tables).
+        if args.db.exists():
+            print(f"[!] Removing existing database file: {args.db}")
+            args.db.unlink()
+        # Clean up any existing artifacts directory to avoid confusion.
+        if artifacts_root.exists():
+            print(f"[!] Removing existing artifacts directory: {artifacts_root}")
+            shutil.rmtree(artifacts_root, ignore_errors=True)
+            # On Windows UNC paths the tree may not be fully gone immediately;
+            # recreate so the main() mkdir calls don't fail.
+            artifacts_root.mkdir(parents=True, exist_ok=True)
 
     asyncio.run(main(
         csv_path=args.csv,
@@ -177,9 +226,11 @@ if __name__ == "__main__":
         artifacts_root=artifacts_root,
         timeout=args.timeout,
         brave_dwell=args.brave_dwell,
+        chrome_dwell=args.chrome_dwell,
         run_wave_flag=not args.no_wave,
         run_lighthouse_flag=not args.no_lighthouse,
         run_nvda_flag=not args.no_nvda,
         run_brave=not args.chrome_only,
         run_chrome=not args.brave_only,
+        resume=args.resume,
     ))
