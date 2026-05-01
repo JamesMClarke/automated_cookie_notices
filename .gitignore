@@ -207,7 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 # Custom rules
-.DS_store
+.DS_Store
 package-lock.json
 *.csv
 *.sqlite
@@ -215,3 +215,5 @@ package-lock.json
 artifacts/
 .claude
 *.tex
+classification_diagram.*
+postProcessor/results/
