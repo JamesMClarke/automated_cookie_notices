@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -46,35 +47,56 @@ type updateRecord struct {
 	isTracker bool
 }
 
+var githubToken string
+
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("Usage: go run main.go <path_to_sqlite_db> <path_to_artifacts_dir>")
-		fmt.Println("Example: go run main.go data/requests.db data/artifacts/")
+	flags := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	flags.StringVar(&githubToken, "github-token", os.Getenv("GITHUB_TOKEN"), "GitHub personal access token (or set GITHUB_TOKEN env var)")
+	reclassify := flags.Bool("reclassify", false, "Re-run cookie classification even for already-processed scans")
+
+	// flag.Parse requires flags before positional args, so split manually.
+	var positional []string
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		if strings.HasPrefix(args[i], "-") {
+			// consume flag + optional value
+			flags.Parse(args[i:])
+			break
+		}
+		positional = append(positional, args[i])
+	}
+	// collect any remaining positional args after flags
+	flags.Visit(func(f *flag.Flag) {})
+	for _, a := range flags.Args() {
+		positional = append(positional, a)
+	}
+	// also collect positional args that came before any flags
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") && (len(positional) == 0 || positional[len(positional)-1] != a) {
+			positional = append(positional, a)
+		}
+	}
+
+	if len(positional) < 2 {
+		fmt.Println("Usage: go run main.go [--github-token <token>] [--reclassify] <path_to_sqlite_db> <path_to_artifacts_dir>")
+		fmt.Println("Example: go run main.go ../top-100.sqlite /Volumes/Backups/cookie_notices_automation/artifacts")
 		return
 	}
-	dbPath := os.Args[1]
-	artifactPath := os.Args[2]
+	dbPath := positional[0]
+	artifactPath := positional[1]
 	fmt.Printf("Using SQLite database at: %s\n", dbPath)
 	fmt.Printf("Using artifacts directory at: %s\n", artifactPath)
 
-	// matcher, ruleInfo := downloadAndLoadRules()
-	// fmt.Printf("Loaded %d rules into memory.\n", len(ruleInfo))
-	// identifyTrackers(matcher, ruleInfo, nil, dbPath)
-
-	// Optional: --cdb-key <license> enables Cookiedatabase.org API enrichment.
-	// var cdbKey string
-	// for i, arg := range os.Args {
-	// 	if arg == "--cdb-key" && i+1 < len(os.Args) {
-	// 		cdbKey = os.Args[i+1]
-	// 	}
-	// }
+	matcher, ruleInfo := downloadAndLoadRules()
+	fmt.Printf("Loaded %d rules into memory.\n", len(ruleInfo))
+	identifyTrackers(matcher, ruleInfo, nil, dbPath)
 
 	lookup, err := loadOCD(ocdCacheFile)
 	if err != nil {
 		fmt.Printf("Error loading Open Cookie Database: %v\n", err)
 		return
 	}
-	classifyCookies(dbPath, artifactPath, lookup)
+	classifyCookies(dbPath, artifactPath, lookup, *reclassify)
 }
 
 type ruleEntry struct {
@@ -161,18 +183,44 @@ func downloadAndLoadRules() (*adblock.RuleMatcher, map[int]ruleEntry) {
 	return matcher, ruleInfo
 }
 
+func githubGet(apiURL string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if githubToken != "" {
+		req.Header.Set("Authorization", "Bearer "+githubToken)
+	}
+	return http.DefaultClient.Do(req)
+}
+
 func downloadRules(name, apiURL string) error {
-	resp, err := http.Get(apiURL)
+	resp, err := githubGet(apiURL)
 	if err != nil {
 		return fmt.Errorf("failed to fetch URL: %w", err)
 	}
 	defer resp.Body.Close()
 
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// GitHub returns an object (with "message") on errors like rate limiting.
+	if len(raw) > 0 && raw[0] == '{' {
+		var apiErr struct {
+			Message string `json:"message"`
+		}
+		json.Unmarshal(raw, &apiErr)
+		return fmt.Errorf("GitHub API error: %s", apiErr.Message)
+	}
+
 	var items []struct {
 		Name        string `json:"name"`
 		DownloadURL string `json:"download_url"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+	if err := json.Unmarshal(raw, &items); err != nil {
 		return fmt.Errorf("failed to parse JSON: %w", err)
 	}
 
@@ -465,7 +513,7 @@ func resolveArtifactPath(stored, artifactPath string) string {
 	return filepath.Join(filepath.Dir(artifactPath), stored)
 }
 
-func classifyCookies(dbPath, artifactPath string, lk *cookieLookup) {
+func classifyCookies(dbPath, artifactPath string, lk *cookieLookup, reclassify bool) {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		fmt.Printf("Error opening database: %v\n", err)
@@ -512,11 +560,23 @@ func classifyCookies(dbPath, artifactPath string, lk *cookieLookup) {
 	}
 
 	// Find scans not yet classified.
+	// A scan is considered done only if it has at least one classified cookie row.
+	// With --reclassify, delete existing rows and reprocess everything.
+	if reclassify {
+		if _, err := db.Exec(`DELETE FROM cookie_classifications`); err != nil {
+			fmt.Printf("Error clearing cookie_classifications: %v\n", err)
+			return
+		}
+		fmt.Println("[ocd] Cleared existing classifications for full re-run.")
+	}
 	rows, err := db.Query(`
-		SELECT id, pre_cookies_path, post_accept_cookies_path, post_reject_cookies_path
-		FROM chrome_scans
-		WHERE id NOT IN (SELECT DISTINCT scan_id FROM cookie_classifications)
-		ORDER BY id`)
+		SELECT cs.id, cs.pre_cookies_path, cs.post_accept_cookies_path, cs.post_reject_cookies_path
+		FROM chrome_scans cs
+		LEFT JOIN (
+			SELECT DISTINCT scan_id FROM cookie_classifications WHERE category IS NOT NULL
+		) cc ON cs.id = cc.scan_id
+		WHERE cc.scan_id IS NULL
+		ORDER BY cs.id`)
 	if err != nil {
 		fmt.Printf("Error querying chrome_scans: %v\n", err)
 		return
@@ -540,7 +600,12 @@ func classifyCookies(dbPath, artifactPath string, lk *cookieLookup) {
 	rows.Close()
 
 	if len(scans) == 0 {
-		fmt.Println("[ocd] Nothing to classify — all scans already processed.")
+		var totalScans, totalCC, classifiedScans int
+		db.QueryRow(`SELECT COUNT(*) FROM chrome_scans`).Scan(&totalScans)
+		db.QueryRow(`SELECT COUNT(*) FROM cookie_classifications`).Scan(&totalCC)
+		db.QueryRow(`SELECT COUNT(DISTINCT scan_id) FROM cookie_classifications WHERE category IS NOT NULL`).Scan(&classifiedScans)
+		fmt.Printf("[ocd] Nothing to classify — chrome_scans: %d row(s), cookie_classifications: %d row(s) total, %d scan(s) with classified cookies.\n",
+			totalScans, totalCC, classifiedScans)
 		return
 	}
 	fmt.Printf("[ocd] Classifying cookies for %d scan(s)…\n", len(scans))
