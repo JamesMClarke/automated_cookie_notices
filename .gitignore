@@ -216,5 +216,5 @@ artifacts/
 .claude
 *.tex
 classification_diagram.*
-postProcessor/results/
+postProcessor/rules
 postProcessor/main

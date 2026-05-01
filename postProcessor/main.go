@@ -97,6 +97,7 @@ func main() {
 		return
 	}
 	classifyCookies(dbPath, artifactPath, lookup, *reclassify)
+	classifyStorage(dbPath, artifactPath, lookup, *reclassify)
 }
 
 type ruleEntry struct {
@@ -863,4 +864,239 @@ func nullStr(s string) interface{} {
 		return nil
 	}
 	return s
+}
+
+// ---------------------------------------------------------------------------
+// Storage classification – localStorage / sessionStorage
+// ---------------------------------------------------------------------------
+
+type storageJSON struct {
+	Local   map[string]string `json:"localStorage"`
+	Session map[string]string `json:"sessionStorage"`
+}
+
+func classifyStorage(dbPath, artifactPath string, lk *cookieLookup, reclassify bool) {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		fmt.Printf("[storage] Error opening database: %v\n", err)
+		return
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS storage_classifications (
+		id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+		scan_id                 INTEGER NOT NULL REFERENCES chrome_scans(id),
+		phase                   TEXT    NOT NULL CHECK(phase IN ('pre','post_accept','post_reject')),
+		storage_type            TEXT    NOT NULL CHECK(storage_type IN ('local','session')),
+		storage_key             TEXT    NOT NULL,
+		category                TEXT,
+		platform                TEXT,
+		matched_pattern         TEXT,
+		is_wildcard             INTEGER NOT NULL DEFAULT 0,
+		source                  TEXT,
+		purpose                 TEXT,
+		cookie_function         TEXT,
+		is_personal_data        INTEGER,
+		collected_personal_data TEXT,
+		retention               TEXT
+	)`)
+	if err != nil {
+		fmt.Printf("[storage] Error creating storage_classifications table: %v\n", err)
+		return
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_sc_scan_id ON storage_classifications(scan_id)`)
+	if err != nil {
+		fmt.Printf("[storage] Error creating index: %v\n", err)
+		return
+	}
+
+	if reclassify {
+		if _, err := db.Exec(`DELETE FROM storage_classifications`); err != nil {
+			fmt.Printf("[storage] Error clearing storage_classifications: %v\n", err)
+			return
+		}
+		fmt.Println("[storage] Cleared existing classifications for full re-run.")
+	}
+
+	rows, err := db.Query(`
+		SELECT cs.id, cs.pre_storage_path, cs.post_accept_storage_path, cs.post_reject_storage_path
+		FROM chrome_scans cs
+		LEFT JOIN (
+			SELECT DISTINCT scan_id FROM storage_classifications WHERE category IS NOT NULL
+		) sc ON cs.id = sc.scan_id
+		WHERE sc.scan_id IS NULL
+		ORDER BY cs.id`)
+	if err != nil {
+		fmt.Printf("[storage] Error querying chrome_scans: %v\n", err)
+		return
+	}
+
+	type scanRow struct {
+		id             int
+		prePath        sql.NullString
+		postAcceptPath sql.NullString
+		postRejectPath sql.NullString
+	}
+	var scans []scanRow
+	for rows.Next() {
+		var s scanRow
+		if err := rows.Scan(&s.id, &s.prePath, &s.postAcceptPath, &s.postRejectPath); err != nil {
+			fmt.Printf("[storage] Error scanning row: %v\n", err)
+			continue
+		}
+		scans = append(scans, s)
+	}
+	rows.Close()
+
+	if len(scans) == 0 {
+		fmt.Println("[storage] Nothing to classify.")
+		return
+	}
+	fmt.Printf("[storage] Classifying storage for %d scan(s)…\n", len(scans))
+
+	phases := []struct {
+		name string
+		fn   func(scanRow) sql.NullString
+	}{
+		{"pre", func(s scanRow) sql.NullString { return s.prePath }},
+		{"post_accept", func(s scanRow) sql.NullString { return s.postAcceptPath }},
+		{"post_reject", func(s scanRow) sql.NullString { return s.postRejectPath }},
+	}
+
+	stmt, err := db.Prepare(`INSERT INTO storage_classifications
+		(scan_id, phase, storage_type, storage_key, category, platform, matched_pattern, is_wildcard, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		fmt.Printf("[storage] Error preparing insert: %v\n", err)
+		return
+	}
+	defer stmt.Close()
+
+	total := 0
+	for i, s := range scans {
+		for _, ph := range phases {
+			p := ph.fn(s)
+			if !p.Valid || p.String == "" {
+				continue
+			}
+			storagePath := resolveArtifactPath(p.String, artifactPath)
+			data, err := os.ReadFile(storagePath)
+			if err != nil {
+				continue
+			}
+			var storage storageJSON
+			if err := json.Unmarshal(data, &storage); err != nil {
+				fmt.Printf("[storage] Warning: could not parse %s: %v\n", storagePath, err)
+				continue
+			}
+			for storageType, items := range map[string]map[string]string{
+				"local":   storage.Local,
+				"session": storage.Session,
+			} {
+				for key := range items {
+					match := lk.classify(key)
+					var category, platform, matchedPattern, source string
+					isWildcard := 0
+					if match != nil {
+						category = match.category
+						platform = match.platform
+						matchedPattern = match.pattern
+						source = "ocd"
+						if match.wildcard {
+							isWildcard = 1
+						}
+					}
+					if _, err := stmt.Exec(s.id, ph.name, storageType, key,
+						nullStr(category), nullStr(platform), nullStr(matchedPattern), isWildcard, nullStr(source)); err != nil {
+						fmt.Printf("[storage] Error inserting record: %v\n", err)
+						continue
+					}
+					total++
+				}
+			}
+		}
+		if (i+1)%10 == 0 || i+1 == len(scans) {
+			fmt.Printf("  [storage] [%d/%d] %d storage records written\n", i+1, len(scans), total)
+		}
+	}
+
+	fmt.Printf("[storage] Done. %d storage classification records written.\n", total)
+
+	enrichStorageFromCDB(db)
+}
+
+func enrichStorageFromCDB(db *sql.DB) {
+	rows, err := db.Query(
+		`SELECT DISTINCT storage_key FROM storage_classifications WHERE category IS NULL`)
+	if err != nil {
+		fmt.Printf("[storage-cdb] Error querying unknowns: %v\n", err)
+		return
+	}
+	var unknowns []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err == nil && name != "" {
+			unknowns = append(unknowns, name)
+		}
+	}
+	rows.Close()
+
+	if len(unknowns) == 0 {
+		fmt.Println("[storage-cdb] No unclassified storage keys — skipping Cookiedatabase.org lookup.")
+		return
+	}
+	fmt.Printf("[storage-cdb] Querying Cookiedatabase.org for %d unrecognised key(s)…\n", len(unknowns))
+
+	found := make(map[string]*cdbResult)
+	for i := 0; i < len(unknowns); i += cdbBatchSize {
+		end := i + cdbBatchSize
+		if end > len(unknowns) {
+			end = len(unknowns)
+		}
+		results, err := queryCDB(unknowns[i:end])
+		if err != nil {
+			fmt.Printf("[storage-cdb] Warning: batch %d–%d failed: %v\n", i+1, end, err)
+		} else {
+			for k, v := range results {
+				found[k] = v
+			}
+		}
+		if end < len(unknowns) {
+			time.Sleep(cdbDelay)
+		}
+	}
+
+	if len(found) == 0 {
+		fmt.Println("[storage-cdb] Cookiedatabase.org returned no matches.")
+		return
+	}
+
+	updStmt, err := db.Prepare(
+		`UPDATE storage_classifications
+		 SET category = ?, platform = ?, purpose = ?, cookie_function = ?,
+		     is_personal_data = ?, collected_personal_data = ?, retention = ?,
+		     source = 'cookiedatabase.org'
+		 WHERE storage_key = ? AND category IS NULL`)
+	if err != nil {
+		fmt.Printf("[storage-cdb] Error preparing update: %v\n", err)
+		return
+	}
+	defer updStmt.Close()
+
+	updated := 0
+	for name, r := range found {
+		res, err := updStmt.Exec(
+			nullStr(r.category), nullStr(r.platform), nullStr(r.purpose),
+			nullStr(r.cookieFunction), r.isPersonalData, nullStr(r.collectedPersonalData),
+			nullStr(r.retention), name,
+		)
+		if err != nil {
+			fmt.Printf("[storage-cdb] Error updating %q: %v\n", name, err)
+			continue
+		}
+		n, _ := res.RowsAffected()
+		updated += int(n)
+	}
+	fmt.Printf("[storage-cdb] Updated %d row(s) from Cookiedatabase.org (%d name(s) matched).\n",
+		updated, len(found))
 }
