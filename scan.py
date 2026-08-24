@@ -21,15 +21,19 @@ from pathlib import Path
 
 from playwright.async_api import async_playwright
 
+import chrome_scan
 from brave_scan import (
     brave_process_url,
-    init_db as brave_init_db,
     launch_brave,
     load_urls,
 )
-import chrome_scan
+from brave_scan import (
+    init_db as brave_init_db,
+)
 from chrome_scan import (
     chrome_process_url,
+)
+from chrome_scan import (
     init_db as chrome_init_db,
 )
 
@@ -56,6 +60,7 @@ async def main(
     run_brave: bool,
     run_chrome: bool,
     resume: bool,
+    with_reject: bool = True,
 ) -> None:
     urls = load_urls(csv_path)
     if not urls:
@@ -88,6 +93,7 @@ async def main(
         run_wave_flag=run_wave_flag,
         run_lighthouse_flag=run_lighthouse_flag,
         run_nvda_flag=run_nvda_flag,
+        with_reject=with_reject,
     )
     brave_shared = dict(
         timeout=timeout,
@@ -100,18 +106,16 @@ async def main(
         skipped_chrome = len(chrome_done) if run_chrome else 0
         skipped_brave = len(brave_done) if run_brave else 0
         remaining = [
-            u for u in urls
-            if (not run_chrome or u not in chrome_done)
-            or (not run_brave or u not in brave_done)
+            u for u in urls if (not run_chrome or u not in chrome_done) or (not run_brave or u not in brave_done)
         ]
     else:
         skipped_chrome = skipped_brave = 0
         remaining = urls
 
     print(f"[!] Starting scans at {asyncio.get_event_loop().time():.2f} seconds.")
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  Combined Scanner  ({len(urls)} URLs)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  Input:       {csv_path}")
     print(f"  Database:    {db_path}")
     print(f"  Artifacts:   {artifacts_root}")
@@ -121,6 +125,7 @@ async def main(
     print(f"  NVDA:        {'yes' if run_nvda_flag else 'no'}")
     print(f"  Brave scan:  {'yes' if run_brave else 'no'}")
     print(f"  Chrome scan: {'yes' if run_chrome else 'no'}")
+    print(f"  Reject scan: {'yes' if with_reject else 'no'}")
     print(f"  Resume:      {'yes' if resume else 'no'}")
     if resume:
         print(f"  Skipping:    {skipped_chrome} chrome / {skipped_brave} brave already-scanned URLs")
@@ -132,22 +137,23 @@ async def main(
                 print(f"[{i}/{len(remaining)}] {url}")
 
                 if run_chrome and url not in chrome_done:
-                    await chrome_process_url(
-                        chrome_con, p, url, chrome_artifacts, **chrome_shared
-                    )
+                    try:
+                        await chrome_process_url(chrome_con, p, url, chrome_artifacts, **chrome_shared)
+                    except Exception as _e:
+                        print(f"  [chrome] unhandled error for {url}: {str(_e).splitlines()[0]}")
                 elif run_chrome:
-                    print(f"  [chrome] skipping (already scanned)")
+                    print("  [chrome] skipping (already scanned)")
 
                 if run_brave and url not in brave_done:
                     brave_context, _ = await launch_brave(p)
                     try:
-                        await brave_process_url(
-                            brave_con, brave_context, url, brave_artifacts, **brave_shared
-                        )
+                        await brave_process_url(brave_con, brave_context, url, brave_artifacts, **brave_shared)
+                    except Exception as _e:
+                        print(f"  [brave]  unhandled error for {url}: {str(_e).splitlines()[0]}")
                     finally:
                         await brave_context.close()
                 elif run_brave:
-                    print(f"  [brave]  skipping (already scanned)")
+                    print("  [brave]  skipping (already scanned)")
         finally:
             if run_brave:
                 brave_con.close()
@@ -160,35 +166,36 @@ async def main(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run Brave and Chrome accessibility scans into a single database."
-    )
+    parser = argparse.ArgumentParser(description="Run Brave and Chrome accessibility scans into a single database.")
     parser.add_argument("csv", type=Path, help="CSV file of URLs")
-    parser.add_argument("db",  type=Path, help="SQLite output file")
+    parser.add_argument("db", type=Path, help="SQLite output file")
     parser.add_argument(
-        "--artifacts", type=Path, default=None,
+        "--artifacts",
+        type=Path,
+        default=None,
         help="Directory for artifacts (default: <db_dir>/artifacts/)",
     )
-    parser.add_argument("--timeout", type=int, default=30,
-                        help="Navigation timeout in seconds (default: 30)")
-    parser.add_argument("--brave-dwell", type=int, default=60,
-                        help="Seconds Brave dwells after page load (default: 60)")
-    parser.add_argument("--chrome-dwell", type=int, default=60,
-                        help="Seconds Chrome dwells after cookie acceptance (default: 60)")
-    parser.add_argument("--no-wave",       action="store_true",
-                        help="Skip WAVE accessibility injection")
-    parser.add_argument("--no-lighthouse", action="store_true",
-                        help="Skip Lighthouse accessibility audit")
-    parser.add_argument("--no-nvda",       action="store_true",
-                        help="Skip NVDA screen reader transcript")
-    parser.add_argument("--brave-only",  action="store_true",
-                        help="Run Brave scan only")
-    parser.add_argument("--chrome-only", action="store_true",
-                        help="Run Chrome scan only")
-    parser.add_argument("--debug",       action="store_true",
-                        help="Print verbose Chrome cookie-acceptance diagnostics")
-    parser.add_argument("--resume",      action="store_true",
-                        help="Resume a previous scan — skip URLs already in the database")
+    parser.add_argument("--timeout", type=int, default=30, help="Navigation timeout in seconds (default: 30)")
+    parser.add_argument(
+        "--brave-dwell", type=int, default=60, help="Seconds Brave dwells after page load (default: 60)"
+    )
+    parser.add_argument(
+        "--chrome-dwell", type=int, default=60, help="Seconds Chrome dwells after cookie acceptance (default: 60)"
+    )
+    parser.add_argument("--no-wave", action="store_true", help="Skip WAVE accessibility injection")
+    parser.add_argument("--no-lighthouse", action="store_true", help="Skip Lighthouse accessibility audit")
+    parser.add_argument("--no-nvda", action="store_true", help="Skip NVDA screen reader transcript")
+    parser.add_argument(
+        "--no-reject",
+        action="store_true",
+        help="Skip the reject phase (by default Chrome also rejects the cookie notice)",
+    )
+    parser.add_argument("--brave-only", action="store_true", help="Run Brave scan only")
+    parser.add_argument("--chrome-only", action="store_true", help="Run Chrome scan only")
+    parser.add_argument("--debug", action="store_true", help="Print verbose Chrome cookie-acceptance diagnostics")
+    parser.add_argument(
+        "--resume", action="store_true", help="Resume a previous scan — skip URLs already in the database"
+    )
     args = parser.parse_args()
 
     if args.debug:
@@ -220,17 +227,20 @@ if __name__ == "__main__":
             # recreate so the main() mkdir calls don't fail.
             artifacts_root.mkdir(parents=True, exist_ok=True)
 
-    asyncio.run(main(
-        csv_path=args.csv,
-        db_path=args.db,
-        artifacts_root=artifacts_root,
-        timeout=args.timeout,
-        brave_dwell=args.brave_dwell,
-        chrome_dwell=args.chrome_dwell,
-        run_wave_flag=not args.no_wave,
-        run_lighthouse_flag=not args.no_lighthouse,
-        run_nvda_flag=not args.no_nvda,
-        run_brave=not args.chrome_only,
-        run_chrome=not args.brave_only,
-        resume=args.resume,
-    ))
+    asyncio.run(
+        main(
+            csv_path=args.csv,
+            db_path=args.db,
+            artifacts_root=artifacts_root,
+            timeout=args.timeout,
+            brave_dwell=args.brave_dwell,
+            chrome_dwell=args.chrome_dwell,
+            run_wave_flag=not args.no_wave,
+            run_lighthouse_flag=not args.no_lighthouse,
+            run_nvda_flag=not args.no_nvda,
+            run_brave=not args.chrome_only,
+            run_chrome=not args.brave_only,
+            resume=args.resume,
+            with_reject=not args.no_reject,
+        )
+    )

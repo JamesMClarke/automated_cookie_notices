@@ -18,10 +18,11 @@ def cookie_party(site_url, domain_or_url):
     if not domain_or_url:
         return None
     site_r = _reg_domain(site_url)
-    other_r = _reg_domain(domain_or_url.lstrip('.'))
+    other_r = _reg_domain(domain_or_url.lstrip("."))
     if not site_r or not other_r:
         return None
     return "first" if site_r == other_r else "third"
+
 
 DB_PATH = Path(__file__).parent.parent / "top-1000.sqlite"
 
@@ -108,6 +109,8 @@ def open_merged(db_names=None):
         print("No databases found.", file=sys.stderr)
         sys.exit(1)
     return merge_databases(db_paths), db_paths
+
+
 ARTIFACTS_BASE = Path("/Volumes/Backups/cookie_notices_automation")
 
 NOT_FP = "(false_positive IS NULL OR false_positive=0)"
@@ -230,25 +233,38 @@ def ck_delta(a, b):
     if a is None or b is None:
         return "---"
     d = b - a
-    return (rf"\textbf{{{d:+d}}}" if d != 0 else "0")
+    return rf"\textbf{{{d:+d}}}" if d != 0 else "0"
 
 
 def wilcoxon_p(pre, post, alternative="two-sided"):
-    """Wilcoxon signed-rank test on paired non-None values. Returns (stat, p) or (None, None)."""
+    """Wilcoxon signed-rank test on paired non-None values. Returns (stat, p, r) or (None, None, None).
+
+    r is the rank-biserial correlation: positive means post > pre on average.
+    """
     try:
         from scipy.stats import wilcoxon as _wilcoxon
     except ImportError:
-        return None, None
+        return None, None, None
     pairs = [(a, b) for a, b in zip(pre, post) if a is not None and b is not None]
     if len(pairs) < 10:
-        return None, None
-    pre_a  = [p[0] for p in pairs]
+        return None, None, None
+    pre_a = [p[0] for p in pairs]
     post_a = [p[1] for p in pairs]
     try:
         stat, p = _wilcoxon(pre_a, post_a, alternative=alternative)
-        return stat, p
+        diffs = [b - a for a, b in zip(pre_a, post_a)]
+        nonzero = [d for d in diffs if d != 0]
+        n_nz = len(nonzero)
+        if n_nz == 0:
+            return stat, p, 0.0
+        total = n_nz * (n_nz + 1) / 2
+        r_magnitude = 1.0 - (2.0 * stat) / total
+        # sign: positive when post > pre
+        direction = 1 if sum(nonzero) > 0 else -1
+        r = direction * r_magnitude
+        return stat, p, r
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def fmt_p(p):
@@ -258,3 +274,10 @@ def fmt_p(p):
     if p < 0.001:
         return r"$<\!0.001$"
     return rf"${p:.3f}$"
+
+
+def fmt_r(r):
+    """Format a rank-biserial correlation for LaTeX."""
+    if r is None:
+        return "---"
+    return rf"${r:+.2f}$"

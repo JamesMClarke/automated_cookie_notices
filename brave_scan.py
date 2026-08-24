@@ -1,6 +1,5 @@
 """
 brave_shields_test.py
-=====================
 Counts requests blocked by Brave Shields, runs WAVE accessibility injection,
 and runs a Lighthouse accessibility audit for each URL in a CSV file.
 Results are saved to SQLite. Screenshots and HTML snapshots are saved per site.
@@ -46,7 +45,6 @@ import json
 import re
 import shutil
 import sqlite3
-import subprocess
 import sys
 
 # On Windows, npm CLIs are installed as .cmd files which CreateProcess won't
@@ -56,13 +54,18 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from playwright.async_api import async_playwright, Page, BrowserContext
+
+from playwright.async_api import BrowserContext, Page, async_playwright
+
 from nvda_capture import capture_nvda_transcript, restart_nvda
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# Configuration
+
 
 def _find_brave() -> str:
-    import sys, os
+    import os
+    import sys
+
     if sys.platform == "win32":
         candidates = [
             r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
@@ -71,19 +74,18 @@ def _find_brave() -> str:
         for p in candidates:
             if os.path.exists(p):
                 return p
-        raise FileNotFoundError(
-            "Brave not found. Checked:\n" + "\n".join(f"  {p}" for p in candidates)
-        )
+        raise FileNotFoundError("Brave not found. Checked:\n" + "\n".join(f"  {p}" for p in candidates))
     if sys.platform == "darwin":
         return "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
     return "/usr/bin/brave-browser"  # Linux
 
+
 BRAVE_PATH = _find_brave()
 
-GOLDEN_PROFILE_DIR   = Path(__file__).parent / ".brave_golden_profile"
-WAVE_JS_PATH         = Path(__file__).parent / "wave.min.js"
-LH_CONFIG_PATH       = Path(__file__).parent / "custom-config.mjs"
-FILTER_LIST_WAIT   = 20
+GOLDEN_PROFILE_DIR = Path(__file__).parent / ".brave_golden_profile"
+WAVE_JS_PATH = Path(__file__).parent / "wave.min.js"
+LH_CONFIG_PATH = Path(__file__).parent / "custom-config.mjs"
+FILTER_LIST_WAIT = 20
 
 LAUNCH_ARGS = [
     "--no-first-run",
@@ -101,12 +103,11 @@ IGNORE_DEFAULT_ARGS = [
 ]
 
 # Default WAVE stats returned when injection fails
-_WAVE_EMPTY = {"error": None, "contrast": None, "alert": None,
-               "feature": None, "structure": None, "aria": None}
-_WAVE_ZERO  = {"error": 0,  "contrast": 0,  "alert": 0,
-               "feature": 0,  "structure": 0,  "aria": 0}
+_WAVE_EMPTY = {"error": None, "contrast": None, "alert": None, "feature": None, "structure": None, "aria": None}
+_WAVE_ZERO = {"error": 0, "contrast": 0, "alert": 0, "feature": 0, "structure": 0, "aria": 0}
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# Helpers
+
 
 def safe_dirname(url: str) -> str:
     name = re.sub(r"https?://", "", url)
@@ -121,7 +122,21 @@ def artifact_dir(artifacts_root: Path, scan_id: int, url: str) -> Path:
     return d
 
 
-# ── SQLite ─────────────────────────────────────────────────────────────────────
+def _page_is_oom(page, crashed: bool) -> bool:
+    """Non-blocking OOM check — crash-event flag or chrome-error:// URL.
+
+    page.url is a locally-cached property (no CDP round-trip) so it never hangs.
+    """
+    if crashed:
+        return True
+    try:
+        return page.url.startswith("chrome-error:")
+    except Exception:
+        return False
+
+
+# SQLite
+
 
 def init_db(db_path: Path) -> sqlite3.Connection:
     con = sqlite3.connect(db_path)
@@ -176,7 +191,8 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     return con
 
 
-# ── CSV loading ────────────────────────────────────────────────────────────────
+# CSV loading
+
 
 def load_urls(csv_path: Path) -> list[str]:
     """
@@ -206,7 +222,8 @@ def load_urls(csv_path: Path) -> list[str]:
     return urls
 
 
-# ── Golden profile ─────────────────────────────────────────────────────────────
+# Golden profile
+
 
 async def _bootstrap_golden_profile() -> None:
     print("[*] Golden profile not found — creating it now.")
@@ -230,10 +247,19 @@ async def _bootstrap_golden_profile() -> None:
 def _make_run_profile() -> Path:
     run_dir = Path(tempfile.mkdtemp(prefix="brave_run_"))
     shutil.copytree(
-        str(GOLDEN_PROFILE_DIR), str(run_dir), dirs_exist_ok=True,
+        str(GOLDEN_PROFILE_DIR),
+        str(run_dir),
+        dirs_exist_ok=True,
         ignore=shutil.ignore_patterns(
-            "SingletonLock", "SingletonCookie", "SingletonSocket",
-            "Cache", "Code Cache", "GPUCache", "ShaderCache", "*.log", "*.lck",
+            "SingletonLock",
+            "SingletonCookie",
+            "SingletonSocket",
+            "Cache",
+            "Code Cache",
+            "GPUCache",
+            "ShaderCache",
+            "*.log",
+            "*.lck",
         ),
     )
     return run_dir
@@ -246,7 +272,8 @@ async def ensure_golden_profile() -> None:
         print(f"[*] Using golden profile at {GOLDEN_PROFILE_DIR}")
 
 
-# ── Browser launch ─────────────────────────────────────────────────────────────
+# Browser launch
+
 
 async def launch_brave(playwright) -> tuple[BrowserContext, Page]:
     await ensure_golden_profile()
@@ -264,7 +291,8 @@ async def launch_brave(playwright) -> tuple[BrowserContext, Page]:
     return context, page
 
 
-# ── WAVE injection ─────────────────────────────────────────────────────────────
+# WAVE injection
+
 
 async def run_wave(page: Page, output_path: Path | None = None) -> dict:
     """
@@ -317,7 +345,8 @@ async def run_wave(page: Page, output_path: Path | None = None) -> dict:
     return wave_stats
 
 
-# ── Lighthouse ─────────────────────────────────────────────────────────────────
+# Lighthouse
+
 
 async def run_lighthouse(
     url: str,
@@ -337,12 +366,13 @@ async def run_lighthouse(
 
     try:
         result = await asyncio.create_subprocess_exec(
-            _LH_CMD, url,
+            _LH_CMD,
+            url,
             "--output=json",
             f"--output-path={lh_json}",
             f"--config-path={LH_CONFIG_PATH}",
-            "--port=9222",          # attach to our running Brave instance
-            "--chrome-flags=",      # don't launch a new browser
+            "--port=9222",  # attach to our running Brave instance
+            "--chrome-flags=",  # don't launch a new browser
             "--quiet",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -356,7 +386,7 @@ async def run_lighthouse(
 
         if lh_json.exists():
             report = json.loads(lh_json.read_text())
-            score  = report.get("categories", {}).get("accessibility", {}).get("score")
+            score = report.get("categories", {}).get("accessibility", {}).get("score")
             if score is not None:
                 score = round(score * 100, 1)  # Lighthouse returns 0.0–1.0
 
@@ -365,18 +395,14 @@ async def run_lighthouse(
                 # Lighthouse report shape differs by version:
                 # - Newer: report["fullPageScreenshot"]["screenshot"]["data"]
                 # - Older: report["audits"]["full-page-screenshot"]["details"]["screenshot"]["data"]
-                ss_data = (
-                    report.get("fullPageScreenshot", {})
-                          .get("screenshot", {})
-                          .get("data", "")
-                )
+                ss_data = report.get("fullPageScreenshot", {}).get("screenshot", {}).get("data", "")
                 if not ss_data:
                     ss_data = (
                         report.get("audits", {})
-                              .get("full-page-screenshot", {})
-                              .get("details", {})
-                              .get("screenshot", {})
-                              .get("data", "")
+                        .get("full-page-screenshot", {})
+                        .get("details", {})
+                        .get("screenshot", {})
+                        .get("data", "")
                     )
 
                 if ss_data.startswith("data:"):
@@ -389,6 +415,7 @@ async def run_lighthouse(
                     if ss_path.suffix.lower() == ".png" and ext.lower() != "png":
                         try:
                             import io
+
                             pil_image = __import__("PIL.Image", fromlist=["Image"])
 
                             raw = base64.b64decode(b64)
@@ -416,7 +443,8 @@ async def run_lighthouse(
     return None
 
 
-# ── Capture helpers ────────────────────────────────────────────────────────────
+# Capture helpers
+
 
 async def capture_screenshot(page: Page, dest: Path) -> str | None:
     try:
@@ -435,6 +463,7 @@ async def capture_html(page: Page, dest: Path) -> str | None:
         print(f"       [!] HTML capture failed: {e}")
         return None
 
+
 async def capture_cookies(page: Page, dest: Path) -> str | None:
     try:
         cookies = await page.context.cookies()
@@ -444,7 +473,9 @@ async def capture_cookies(page: Page, dest: Path) -> str | None:
         print(f"       [!] Cookie capture failed: {e}")
         return None
 
-# ── Core scan ──────────────────────────────────────────────────────────────────
+
+# Core scan
+
 
 async def scan_url(
     context: BrowserContext,
@@ -458,53 +489,58 @@ async def scan_url(
     run_nvda_flag: bool = True,
 ) -> dict:
     page = await context.new_page()
-    cdp  = await context.new_cdp_session(page)
+    page.set_default_timeout(15_000)
+    cdp = await context.new_cdp_session(page)
 
     requests: dict[str, dict] = {}
-    http_status: int | None   = None
-    nav_error:   str | None   = None
+    http_status: int | None = None
+    nav_error: str | None = None
+    _crashed = False
+
+    def _on_crash():
+        nonlocal _crashed
+        _crashed = True
+
+    page.on("crash", _on_crash)
 
     await cdp.send("Network.enable")
 
     def on_request(params):
         req = params.get("request", {})
         requests[params["requestId"]] = {
-            "blocked_url":   req.get("url", ""),
+            "blocked_url": req.get("url", ""),
             "resource_type": params.get("type", "Unknown"),
-            "initiator":     params.get("initiator", {}).get("type", "unknown"),
+            "initiator": params.get("initiator", {}).get("type", "unknown"),
         }
 
     def on_loading_failed(params):
-        error  = params.get("errorText", "")
+        error = params.get("errorText", "")
         reason = params.get("blockedReason", "")
         if reason or "ERR_BLOCKED" in error or "net::ERR_ABORTED" in error:
             rid = params.get("requestId")
             if rid in requests:
-                requests[rid]["blocked"]        = True
+                requests[rid]["blocked"] = True
                 requests[rid]["blocked_reason"] = reason or "n/a"
-                requests[rid]["error_text"]     = error
+                requests[rid]["error_text"] = error
 
     cdp.on("Network.requestWillBeSent", on_request)
-    cdp.on("Network.loadingFailed",     on_loading_failed)
+    cdp.on("Network.loadingFailed", on_loading_failed)
 
-    # ── Navigate ───────────────────────────────────────────────────────────────
+    # Navigate
     try:
-        response    = await page.goto(url, wait_until="domcontentloaded",
-                                       timeout=timeout * 1000)
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
         http_status = response.status if response else None
     except Exception as e:
         nav_error = str(e).splitlines()[0]
 
-    is_error_page = bool(
-        nav_error or (http_status is not None and http_status >= 400)
-    )
+    is_error_page = bool(nav_error or (http_status is not None and http_status >= 400))
 
-    # ── Dwell (success only) ───────────────────────────────────────────────────
-    wave_stats       = _WAVE_EMPTY.copy()
-    lh_score         = None
-    lighthouse_path  = None
-    nvda_path        = None
-    cookies_path     = None
+    # Dwell (success only)
+    wave_stats = _WAVE_EMPTY.copy()
+    lh_score = None
+    lighthouse_path = None
+    nvda_path = None
+    cookies_path = None
 
     if is_error_page:
         print(f"       [!] Error page ({nav_error or f'HTTP {http_status}'}) — skipping dwell")
@@ -523,49 +559,57 @@ async def scan_url(
             print(f"       [*] Padding {_remaining:.1f}s to complete {dwell}s dwell...")
             await page.wait_for_timeout(_remaining * 1000)
 
-        art_dir = artifact_dir(artifacts_root, scan_id, url)
+        if _page_is_oom(page, _crashed):
+            print("       [!] OOM / page crash after dwell — skipping captures, recording as error")
+            is_error_page = True
+            nav_error = nav_error or "ERR_OUT_OF_MEMORY"
+        else:
+            art_dir = artifact_dir(artifacts_root, scan_id, url)
 
-        # ── HTML and Screenshot ────────────────────────────────────────────────
-        html_path       = await capture_html(page, art_dir / "page.html")
-        screenshot_path = await capture_screenshot(page, art_dir / "screenshot.png")
-        cookies_path    = await capture_cookies(page, art_dir / "cookies.json")
+            # HTML and Screenshot
+            html_path = await capture_html(page, art_dir / "page.html")
+            screenshot_path = await capture_screenshot(page, art_dir / "screenshot.png")
+            cookies_path = await capture_cookies(page, art_dir / "cookies.json")
 
-        # ── NVDA transcript ───────────────────────────────────────────────────
-        if run_nvda_flag:
-            print("       [*] NVDA transcript...")
-            try:
-                await restart_nvda()
-                nvda_result = await capture_nvda_transcript(art_dir / "nvda.json")
-                if nvda_result is not None:
-                    nvda_path = str(art_dir / "nvda.json")
-                    print(f"       [+] NVDA: {len(nvda_result)} chars")
-                else:
-                    nvda_path = None
-            except Exception as e:
-                print(f"       [!] NVDA skipped: {e}")
+            # NVDA transcript
+            if run_nvda_flag:
+                print("       [*] NVDA transcript...")
+                try:
+                    await restart_nvda()
+                    nvda_result = await capture_nvda_transcript(art_dir / "nvda.json")
+                    if nvda_result is not None:
+                        nvda_path = str(art_dir / "nvda.json")
+                        print(f"       [+] NVDA: {len(nvda_result)} chars")
+                    else:
+                        nvda_path = None
+                except Exception as e:
+                    print(f"       [!] NVDA skipped: {e}")
 
-        # ── Lighthouse ────────────────────────────────────────────────────────
-        if run_lighthouse_flag:
-            print("       [*] Running Lighthouse accessibility audit...")
-            lh_score = await run_lighthouse(
-                url,
-                art_dir,
-                screenshot_file=art_dir / "brave_lighthouse.png",
-            )
-            if lh_score is not None:
-                lighthouse_path = str(art_dir / "lighthouse.json")
+            # Lighthouse
+            if run_lighthouse_flag:
+                print("       [*] Running Lighthouse accessibility audit...")
+                lh_score = await run_lighthouse(
+                    url,
+                    art_dir,
+                    screenshot_file=art_dir / "brave_lighthouse.png",
+                )
+                if lh_score is not None:
+                    lighthouse_path = str(art_dir / "lighthouse.json")
 
-        # ── WAVE ──────────────────────────────────────────────────────────────
-        if run_wave_flag:
-            print("       [*] Running WAVE...")
-            wave_stats = await run_wave(page, art_dir / "wave.json")
-            print(f"       [+] WAVE: {wave_stats}")
+            # WAVE
+            if run_wave_flag:
+                print("       [*] Running WAVE...")
+                try:
+                    wave_stats = await run_wave(page, art_dir / "wave.json")
+                    print(f"       [+] WAVE: {wave_stats}")
+                except Exception as e:
+                    print(f"       [!] WAVE skipped: {str(e).splitlines()[0]}")
 
-    # ── Screenshot and HTML for error pages ───────────────────────────────────
+    # Screenshot and HTML for error pages
     if is_error_page:
-        art_dir         = artifact_dir(artifacts_root, scan_id, url)
+        art_dir = artifact_dir(artifacts_root, scan_id, url)
         screenshot_path = await capture_screenshot(page, art_dir / "screenshot.png")
-        html_path       = await capture_html(page, art_dir / "page.html")
+        html_path = await capture_html(page, art_dir / "page.html")
 
     if screenshot_path:
         print(f"       [+] Screenshot -> {screenshot_path}")
@@ -578,25 +622,26 @@ async def scan_url(
     blocked_details = [r for r in requests.values() if r.get("blocked")]
 
     return {
-        "url":              url,
-        "http_status":      http_status,
-        "error":            nav_error,
-        "is_error_page":    is_error_page,
-        "total_requests":   len(requests),
+        "url": url,
+        "http_status": http_status,
+        "error": nav_error,
+        "is_error_page": is_error_page,
+        "total_requests": len(requests),
         "blocked_requests": len(blocked_details),
-        "block_rate_pct":   round(len(blocked_details) / max(len(requests), 1) * 100, 1),
-        "blocked_details":  blocked_details,
-        "screenshot_path":  screenshot_path,
-        "html_path":        html_path,
-        "wave_stats":       wave_stats,
-        "lh_score":         lh_score,
-        "lighthouse_path":  lighthouse_path,
-        "nvda_path":        nvda_path,
-        "cookies_path":       cookies_path,
+        "block_rate_pct": round(len(blocked_details) / max(len(requests), 1) * 100, 1),
+        "blocked_details": blocked_details,
+        "screenshot_path": screenshot_path,
+        "html_path": html_path,
+        "wave_stats": wave_stats,
+        "lh_score": lh_score,
+        "lighthouse_path": lighthouse_path,
+        "nvda_path": nvda_path,
+        "cookies_path": cookies_path,
     }
 
 
-# ── Per-URL helper (importable by scan.py) ────────────────────────────────────
+# Per-URL helper (importable by scan.py)
+
 
 async def brave_process_url(
     con: sqlite3.Connection,
@@ -619,13 +664,28 @@ async def brave_process_url(
     scan_id = cur.lastrowid
     con.commit()
 
-    stats = await scan_url(
-        context, url, artifacts_root, scan_id,
-        timeout=timeout, dwell=dwell,
-        run_wave_flag=run_wave_flag,
-        run_lighthouse_flag=run_lighthouse_flag,
-        run_nvda_flag=run_nvda_flag,
-    )
+    try:
+        stats = await scan_url(
+            context,
+            url,
+            artifacts_root,
+            scan_id,
+            timeout=timeout,
+            dwell=dwell,
+            run_wave_flag=run_wave_flag,
+            run_lighthouse_flag=run_lighthouse_flag,
+            run_nvda_flag=run_nvda_flag,
+        )
+    except Exception as _fatal:
+        _emsg = str(_fatal).splitlines()[0]
+        print(f"  [brave] fatal error for {url}: {_emsg}")
+        con.execute(
+            "UPDATE brave_scans SET page_error = ?, is_error_page = 1 WHERE id = ?",
+            (_emsg, scan_id),
+        )
+        con.commit()
+        return scan_id
+
     ws = stats["wave_stats"]
 
     con.execute(
@@ -650,14 +710,23 @@ async def brave_process_url(
                nvda_path              = ?
            WHERE id = ?""",
         (
-            stats["http_status"], stats["error"],
+            stats["http_status"],
+            stats["error"],
             1 if stats["is_error_page"] else 0,
-            stats["total_requests"], stats["blocked_requests"],
+            stats["total_requests"],
+            stats["blocked_requests"],
             stats["block_rate_pct"],
-            stats["screenshot_path"], stats["html_path"], stats["cookies_path"],
-            ws.get("error"), ws.get("contrast"), ws.get("alert"),
-            ws.get("feature"), ws.get("structure"), ws.get("aria"),
-            stats["lh_score"], stats["lighthouse_path"],
+            stats["screenshot_path"],
+            stats["html_path"],
+            stats["cookies_path"],
+            ws.get("error"),
+            ws.get("contrast"),
+            ws.get("alert"),
+            ws.get("feature"),
+            ws.get("structure"),
+            ws.get("aria"),
+            stats["lh_score"],
+            stats["lighthouse_path"],
             stats["nvda_path"],
             scan_id,
         ),
@@ -669,8 +738,14 @@ async def brave_process_url(
                     blocked_reason, error_text)
                VALUES (?, ?, ?, ?, ?, ?)""",
             [
-                (scan_id, r["blocked_url"], r.get("resource_type"),
-                 r.get("initiator"), r.get("blocked_reason"), r.get("error_text"))
+                (
+                    scan_id,
+                    r["blocked_url"],
+                    r.get("resource_type"),
+                    r.get("initiator"),
+                    r.get("blocked_reason"),
+                    r.get("error_text"),
+                )
                 for r in stats["blocked_details"]
             ],
         )
@@ -679,14 +754,17 @@ async def brave_process_url(
     if stats["is_error_page"]:
         print(f"       [Brave] error [HTTP {stats['http_status']}] [scan_id={scan_id}]")
     else:
-        print(f"       [Brave] {stats['blocked_requests']} blocked / "
-              f"{stats['total_requests']} total ({stats['block_rate_pct']}%) | "
-              f"WAVE errors: {ws.get('error')} | LH: {stats['lh_score']} "
-              f"[scan_id={scan_id}]")
+        print(
+            f"       [Brave] {stats['blocked_requests']} blocked / "
+            f"{stats['total_requests']} total ({stats['block_rate_pct']}%) | "
+            f"WAVE errors: {ws.get('error')} | LH: {stats['lh_score']} "
+            f"[scan_id={scan_id}]"
+        )
     return scan_id
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# Main
+
 
 async def brave_main(
     csv_path: Path,
@@ -706,9 +784,9 @@ async def brave_main(
     artifacts_root.mkdir(parents=True, exist_ok=True)
     con = init_db(db_path)
 
-    print(f"\n{'='*60}")
-    print(f"  Brave Shields + Accessibility Scanner")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("  Brave Shields + Accessibility Scanner")
+    print(f"{'=' * 60}")
     print(f"  Input:       {csv_path}  ({len(urls)} URLs)")
     print(f"  Database:    {db_path}")
     print(f"  Artifacts:   {artifacts_root}")
@@ -734,8 +812,12 @@ async def brave_main(
                 con.commit()
 
                 stats = await scan_url(
-                    context, url, artifacts_root, scan_id,
-                    timeout=timeout, dwell=dwell,
+                    context,
+                    url,
+                    artifacts_root,
+                    scan_id,
+                    timeout=timeout,
+                    dwell=dwell,
                     run_wave_flag=run_wave_flag,
                     run_lighthouse_flag=run_lighthouse_flag,
                     run_nvda_flag=run_nvda_flag,
@@ -789,24 +871,30 @@ async def brave_main(
                                 blocked_reason, error_text)
                            VALUES (?, ?, ?, ?, ?, ?)""",
                         [
-                            (scan_id, r["blocked_url"], r.get("resource_type"),
-                             r.get("initiator"), r.get("blocked_reason"),
-                             r.get("error_text"))
+                            (
+                                scan_id,
+                                r["blocked_url"],
+                                r.get("resource_type"),
+                                r.get("initiator"),
+                                r.get("blocked_reason"),
+                                r.get("error_text"),
+                            )
                             for r in stats["blocked_details"]
                         ],
                     )
                 con.commit()
 
                 if stats["is_error_page"]:
-                    print(f"       -> error [HTTP {stats['http_status']}] "
-                          f"[scan_id={scan_id}]")
+                    print(f"       -> error [HTTP {stats['http_status']}] [scan_id={scan_id}]")
                 else:
-                    print(f"       -> {stats['blocked_requests']} blocked / "
-                          f"{stats['total_requests']} total "
-                          f"({stats['block_rate_pct']}%) | "
-                          f"WAVE errors: {ws.get('error')} | "
-                          f"LH: {stats['lh_score']} "
-                          f"[scan_id={scan_id}]")
+                    print(
+                        f"       -> {stats['blocked_requests']} blocked / "
+                        f"{stats['total_requests']} total "
+                        f"({stats['block_rate_pct']}%) | "
+                        f"WAVE errors: {ws.get('error')} | "
+                        f"LH: {stats['lh_score']} "
+                        f"[scan_id={scan_id}]"
+                    )
         finally:
             await context.close()
             con.close()
@@ -816,34 +904,40 @@ async def brave_main(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Scan URLs for Brave Shields blocking and accessibility issues."
-    )
+    parser = argparse.ArgumentParser(description="Scan URLs for Brave Shields blocking and accessibility issues.")
     parser.add_argument("csv", type=Path, help="CSV file of URLs (first column used)")
-    parser.add_argument("db",  type=Path, help="SQLite output file")
+    parser.add_argument("db", type=Path, help="SQLite output file")
     parser.add_argument(
-        "--artifacts", type=Path, default=None,
-        help="Directory for screenshots, HTML, Lighthouse reports "
-             "(default: <db_dir>/artifacts/)",
+        "--artifacts",
+        type=Path,
+        default=None,
+        help="Directory for screenshots, HTML, Lighthouse reports (default: <db_dir>/artifacts/)",
     )
     parser.add_argument(
-        "--timeout", type=int, default=30,
+        "--timeout",
+        type=int,
+        default=30,
         help="Navigation timeout in seconds (default: 30)",
     )
     parser.add_argument(
-        "--dwell", type=int, default=60,
+        "--dwell",
+        type=int,
+        default=60,
         help="Seconds to dwell after page load (default: 60)",
     )
     parser.add_argument(
-        "--no-wave", action="store_true",
+        "--no-wave",
+        action="store_true",
         help="Skip WAVE accessibility injection",
     )
     parser.add_argument(
-        "--no-lighthouse", action="store_true",
+        "--no-lighthouse",
+        action="store_true",
         help="Skip Lighthouse accessibility audit",
     )
     parser.add_argument(
-        "--no-nvda", action="store_true",
+        "--no-nvda",
+        action="store_true",
         help="Skip NVDA screen reader transcript",
     )
     args = parser.parse_args()
@@ -854,10 +948,15 @@ if __name__ == "__main__":
 
     artifacts_root = args.artifacts or args.db.parent / "artifacts"
 
-    asyncio.run(brave_main(
-        args.csv, args.db, artifacts_root,
-        args.timeout, args.dwell,
-        run_wave_flag=not args.no_wave,
-        run_lighthouse_flag=not args.no_lighthouse,
-        run_nvda_flag=not args.no_nvda,
-    ))
+    asyncio.run(
+        brave_main(
+            args.csv,
+            args.db,
+            artifacts_root,
+            args.timeout,
+            args.dwell,
+            run_wave_flag=not args.no_wave,
+            run_lighthouse_flag=not args.no_lighthouse,
+            run_nvda_flag=not args.no_nvda,
+        )
+    )

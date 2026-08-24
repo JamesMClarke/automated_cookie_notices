@@ -2,12 +2,11 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .utils import NOT_FP, fmt, latex_escape, q_safe, DEFAULT_DBS
-
+from .utils import ACCEPTED, DEFAULT_DBS, NOT_FP, fmt, latex_escape, q_safe
 
 _DB_LABELS = {
-    "top-1000.sqlite":    "Top",
-    "crawl_two.sqlite":   "Middle",
+    "top-1000.sqlite": "Top",
+    "crawl_two.sqlite": "Middle",
     "crawl_three.sqlite": "Bottom",
 }
 
@@ -19,18 +18,23 @@ def _label(db_path):
 def _metrics(db_path):
     conn = sqlite3.connect(str(db_path))
     try:
+
         def q(sql):
             return conn.execute(sql).fetchall()
 
         reachable = q("SELECT COUNT(*) FROM chrome_scans WHERE is_error_page=0")[0][0]
-        detected  = q(f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP}")[0][0]
+        detected = q(f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP}")[0][0]
 
         avg = q(
             f"""SELECT
-                 ROUND(AVG(pre_lh_score),1),           ROUND(AVG(post_accept_lh_score),1),
-                 ROUND(AVG(pre_wave_error),1),          ROUND(AVG(post_accept_wave_error),1),
-                 ROUND(AVG(pre_wave_contrast),1),       ROUND(AVG(post_accept_wave_contrast),1),
-                 ROUND(AVG(pre_wave_alert),1),          ROUND(AVG(post_accept_wave_alert),1)
+                 ROUND(AVG(pre_lh_score),1),
+                 ROUND(AVG(CASE WHEN {ACCEPTED} THEN post_accept_lh_score END),1),
+                 ROUND(AVG(pre_wave_error),1),
+                 ROUND(AVG(CASE WHEN {ACCEPTED} THEN post_accept_wave_error END),1),
+                 ROUND(AVG(pre_wave_contrast),1),
+                 ROUND(AVG(CASE WHEN {ACCEPTED} THEN post_accept_wave_contrast END),1),
+                 ROUND(AVG(pre_wave_alert),1),
+                 ROUND(AVG(CASE WHEN {ACCEPTED} THEN post_accept_wave_alert END),1)
                FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP}"""
         )[0]
 
@@ -42,93 +46,158 @@ def _metrics(db_path):
                  ROUND(AVG(post_reject_wave_contrast),1),
                  ROUND(AVG(post_reject_wave_alert),1)
                FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP}
-               AND post_reject_lh_score IS NOT NULL""",
+               AND cookie_notice_rejected=1 AND post_reject_lh_score IS NOT NULL""",
         )
         avg_rej = avg_rej[0] if avg_rej else (None, None, None, None)
 
         lh_improved = q(
-            f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP} "
+            f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP} AND {ACCEPTED} "
             f"AND post_accept_lh_score > pre_lh_score"
         )[0][0]
         lh_declined = q(
-            f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP} "
+            f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP} AND {ACCEPTED} "
             f"AND post_accept_lh_score < pre_lh_score"
         )[0][0]
         lh_measured = q(
-            f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP} "
+            f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP} AND {ACCEPTED} "
             f"AND pre_lh_score IS NOT NULL AND post_accept_lh_score IS NOT NULL"
         )[0][0]
 
         we_improved = q(
-            f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP} "
+            f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP} AND {ACCEPTED} "
             f"AND post_accept_wave_error < pre_wave_error"
         )[0][0]
         we_worsened = q(
-            f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP} "
+            f"SELECT COUNT(*) FROM chrome_scans WHERE cookie_notice_detected=1 AND {NOT_FP} AND {ACCEPTED} "
             f"AND post_accept_wave_error > pre_wave_error"
         )[0][0]
+
+        def qc(sql):
+            rows = q_safe(conn, sql)
+            return rows[0][0] if rows else 0
+
+        _rej = f"cookie_notice_detected=1 AND {NOT_FP} AND cookie_notice_rejected=1"
+        detected_rej = qc(f"SELECT COUNT(*) FROM chrome_scans WHERE {_rej}")
+        lh_improved_rej = qc(f"SELECT COUNT(*) FROM chrome_scans WHERE {_rej} AND post_reject_lh_score > pre_lh_score")
+        lh_declined_rej = qc(f"SELECT COUNT(*) FROM chrome_scans WHERE {_rej} AND post_reject_lh_score < pre_lh_score")
+        lh_measured_rej = qc(
+            f"SELECT COUNT(*) FROM chrome_scans WHERE {_rej} "
+            f"AND pre_lh_score IS NOT NULL AND post_reject_lh_score IS NOT NULL"
+        )
+        we_improved_rej = qc(
+            f"SELECT COUNT(*) FROM chrome_scans WHERE {_rej} AND post_reject_wave_error < pre_wave_error"
+        )
+        we_worsened_rej = qc(
+            f"SELECT COUNT(*) FROM chrome_scans WHERE {_rej} AND post_reject_wave_error > pre_wave_error"
+        )
+
+        _ar = f"cookie_notice_detected=1 AND {NOT_FP} AND {ACCEPTED} AND cookie_notice_rejected=1"
+        detected_ar = qc(f"SELECT COUNT(*) FROM chrome_scans WHERE {_ar}")
+        lh_improved_ar = qc(
+            f"SELECT COUNT(*) FROM chrome_scans WHERE {_ar} "
+            f"AND post_reject_lh_score IS NOT NULL AND post_accept_lh_score IS NOT NULL "
+            f"AND post_reject_lh_score > post_accept_lh_score"
+        )
+        lh_declined_ar = qc(
+            f"SELECT COUNT(*) FROM chrome_scans WHERE {_ar} "
+            f"AND post_reject_lh_score IS NOT NULL AND post_accept_lh_score IS NOT NULL "
+            f"AND post_reject_lh_score < post_accept_lh_score"
+        )
+        lh_measured_ar = qc(
+            f"SELECT COUNT(*) FROM chrome_scans WHERE {_ar} "
+            f"AND post_accept_lh_score IS NOT NULL AND post_reject_lh_score IS NOT NULL"
+        )
+        we_improved_ar = qc(
+            f"SELECT COUNT(*) FROM chrome_scans WHERE {_ar} AND post_reject_wave_error < post_accept_wave_error"
+        )
+        we_worsened_ar = qc(
+            f"SELECT COUNT(*) FROM chrome_scans WHERE {_ar} AND post_reject_wave_error > post_accept_wave_error"
+        )
 
     finally:
         conn.close()
 
     return {
-        "reachable": reachable, "detected": detected,
-        "pre_lh":  avg[0], "acc_lh":  avg[1],
-        "pre_we":  avg[2], "acc_we":  avg[3],
-        "pre_wc":  avg[4], "acc_wc":  avg[5],
-        "pre_wa":  avg[6], "acc_wa":  avg[7],
-        "rej_lh":  avg_rej[0], "rej_we": avg_rej[1],
-        "rej_wc":  avg_rej[2], "rej_wa": avg_rej[3],
-        "lh_improved": lh_improved, "lh_declined": lh_declined,
+        "reachable": reachable,
+        "detected": detected,
+        "pre_lh": avg[0],
+        "acc_lh": avg[1],
+        "pre_we": avg[2],
+        "acc_we": avg[3],
+        "pre_wc": avg[4],
+        "acc_wc": avg[5],
+        "pre_wa": avg[6],
+        "acc_wa": avg[7],
+        "rej_lh": avg_rej[0],
+        "rej_we": avg_rej[1],
+        "rej_wc": avg_rej[2],
+        "rej_wa": avg_rej[3],
+        "lh_improved": lh_improved,
+        "lh_declined": lh_declined,
         "lh_measured": lh_measured,
-        "we_improved": we_improved, "we_worsened": we_worsened,
+        "we_improved": we_improved,
+        "we_worsened": we_worsened,
+        "detected_rej": detected_rej,
+        "lh_improved_rej": lh_improved_rej,
+        "lh_declined_rej": lh_declined_rej,
+        "lh_measured_rej": lh_measured_rej,
+        "we_improved_rej": we_improved_rej,
+        "we_worsened_rej": we_worsened_rej,
+        "detected_ar": detected_ar,
+        "lh_improved_ar": lh_improved_ar,
+        "lh_declined_ar": lh_declined_ar,
+        "lh_measured_ar": lh_measured_ar,
+        "we_improved_ar": we_improved_ar,
+        "we_worsened_ar": we_worsened_ar,
     }
 
 
 _SRM_COLS = [
-    ("metric_readable",         r"(i) Readable"),
+    ("metric_readable", r"(i) Readable"),
     ("metric_immediately_read", r"(ii) Immediately Read"),
-    ("metric_keyboard_nav",     r"(iii) Keyboard Navigable"),
-    ("metric_link_purpose",     r"(iv) Link or Button Purpose"),
-    ("metric_abbreviations",    r"(v) Abbreviations Explained"),
-    ("metric_page_titled",      r"(vi) Page Titled"),
-    ("metric_notice_titled",    r"(vii) Cookie Notice Titled"),
+    ("metric_keyboard_nav", r"(iii) Keyboard Navigable"),
+    ("metric_link_purpose", r"(iv) Link or Button Purpose"),
+    ("metric_abbreviations", r"(v) Abbreviations Explained"),
+    ("metric_page_titled", r"(vi) Page Titled"),
+    ("metric_notice_titled", r"(vii) Cookie Notice Titled"),
 ]
 
 _DIST_BUCKETS = [
-    (r"$= 0$",       lambda d: d == 0),
-    (r"$1$--$10$",   lambda d: 1  <= d <= 10),
-    (r"$11$--$30$",  lambda d: 11 <= d <= 30),
+    (r"$= 0$", lambda d: d == 0),
+    (r"$1$--$10$", lambda d: 1 <= d <= 10),
+    (r"$11$--$30$", lambda d: 11 <= d <= 30),
     (r"$31$--$100$", lambda d: 31 <= d <= 100),
-    (r"$> 100$",     lambda d: d > 100),
+    (r"$> 100$", lambda d: d > 100),
 ]
 
 
 def _issue_metrics(db_path):
     conn = sqlite3.connect(str(db_path))
     try:
-        tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
         wave = {}
         if "wave_issues" in tables:
-            for issue_id, desc, pre, acc, rej in conn.execute(f"""
+            for issue_id, desc, category, pre, acc, rej in conn.execute(f"""
                 SELECT wi.issue_id,
                        MAX(wi.description),
+                       wi.category,
                        SUM(CASE WHEN wi.phase='pre'         THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN wi.phase='post_accept' THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN wi.phase='post_reject' THEN 1 ELSE 0 END)
+                       SUM(CASE WHEN wi.phase='post_accept' AND {ACCEPTED} THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN wi.phase='post_reject' AND cs.cookie_notice_rejected=1 THEN 1 ELSE 0 END)
                 FROM wave_issues wi
                 JOIN chrome_scans cs ON cs.id = wi.scan_id
                 WHERE cs.cookie_notice_detected=1 AND {NOT_FP}
+                  AND (wi.phase='pre'
+                    OR (wi.phase='post_accept' AND {ACCEPTED})
+                    OR (wi.phase='post_reject' AND cs.cookie_notice_rejected=1))
                 GROUP BY wi.issue_id, wi.category
-                HAVING SUM(CASE WHEN wi.phase='post_accept' THEN 1 ELSE 0 END)
+                HAVING SUM(CASE WHEN wi.phase='post_accept' AND {ACCEPTED} THEN 1 ELSE 0 END)
                     != SUM(CASE WHEN wi.phase='pre'         THEN 1 ELSE 0 END)
-                OR     SUM(CASE WHEN wi.phase='post_reject' THEN 1 ELSE 0 END)
+                OR     SUM(CASE WHEN wi.phase='post_reject' AND cs.cookie_notice_rejected=1 THEN 1 ELSE 0 END)
                     != SUM(CASE WHEN wi.phase='pre'         THEN 1 ELSE 0 END)
             """).fetchall():
-                wave[issue_id] = (desc or issue_id, pre or 0, acc or 0, rej or 0)
+                wave[issue_id] = (desc or issue_id, pre or 0, acc or 0, rej or 0, category or "")
 
         lh = {}
         if "lighthouse_issues" in tables:
@@ -136,15 +205,18 @@ def _issue_metrics(db_path):
                 SELECT lhi.audit_id,
                        MAX(lhi.title),
                        SUM(CASE WHEN lhi.phase='pre'         THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN lhi.phase='post_accept' THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN lhi.phase='post_reject' THEN 1 ELSE 0 END)
+                       SUM(CASE WHEN lhi.phase='post_accept' AND {ACCEPTED} THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN lhi.phase='post_reject' AND cs.cookie_notice_rejected=1 THEN 1 ELSE 0 END)
                 FROM lighthouse_issues lhi
                 JOIN chrome_scans cs ON cs.id = lhi.scan_id
                 WHERE cs.cookie_notice_detected=1 AND {NOT_FP}
+                  AND (lhi.phase='pre'
+                    OR (lhi.phase='post_accept' AND {ACCEPTED})
+                    OR (lhi.phase='post_reject' AND cs.cookie_notice_rejected=1))
                 GROUP BY lhi.audit_id
-                HAVING SUM(CASE WHEN lhi.phase='post_accept' THEN 1 ELSE 0 END)
+                HAVING SUM(CASE WHEN lhi.phase='post_accept' AND {ACCEPTED} THEN 1 ELSE 0 END)
                     != SUM(CASE WHEN lhi.phase='pre'         THEN 1 ELSE 0 END)
-                OR     SUM(CASE WHEN lhi.phase='post_reject' THEN 1 ELSE 0 END)
+                OR     SUM(CASE WHEN lhi.phase='post_reject' AND cs.cookie_notice_rejected=1 THEN 1 ELSE 0 END)
                     != SUM(CASE WHEN lhi.phase='pre'         THEN 1 ELSE 0 END)
             """).fetchall():
                 lh[audit_id] = (title or audit_id, pre or 0, acc or 0, rej or 0)
@@ -157,44 +229,49 @@ def _issue_metrics(db_path):
 def _srm_metrics(db_path):
     conn = sqlite3.connect(str(db_path))
     try:
-        has_tbl = bool(conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='screen_reader_metrics'"
-        ).fetchone())
+        has_tbl = bool(
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='screen_reader_metrics'"
+            ).fetchone()
+        )
         if not has_tbl:
             return None
 
         col_parts = ", ".join(
-            f"SUM(CASE WHEN {col}=1 THEN 1 ELSE 0 END), "
-            f"SUM(CASE WHEN {col}=0 THEN 1 ELSE 0 END)"
+            f"SUM(CASE WHEN {col}=1 THEN 1 ELSE 0 END), SUM(CASE WHEN {col}=0 THEN 1 ELSE 0 END)"
             for col, _ in _SRM_COLS
         )
         row = conn.execute(f"""
             SELECT {col_parts}
             FROM screen_reader_metrics srm
             JOIN chrome_scans cs ON cs.id = srm.scan_id
-            WHERE cs.is_error_page=0
+            WHERE cs.is_error_page=0 AND {NOT_FP}
         """).fetchone()
 
         rates = {}
         for i, (col, _) in enumerate(_SRM_COLS):
-            p  = row[i * 2]     or 0
+            p = row[i * 2] or 0
             f_ = row[i * 2 + 1] or 0
-            n  = p + f_
+            n = p + f_
             rates[col] = (p, f_, n)
 
-        has_dist = bool(conn.execute(
-            "SELECT 1 FROM pragma_table_info('screen_reader_metrics') "
-            "WHERE name='immediately_read_distance'"
-        ).fetchone())
+        has_dist = bool(
+            conn.execute(
+                "SELECT 1 FROM pragma_table_info('screen_reader_metrics') WHERE name='immediately_read_distance'"
+            ).fetchone()
+        )
         distances = []
         if has_dist:
-            distances = [r[0] for r in conn.execute("""
+            distances = [
+                r[0]
+                for r in conn.execute(f"""
                 SELECT srm.immediately_read_distance
                 FROM screen_reader_metrics srm
                 JOIN chrome_scans cs ON cs.id = srm.scan_id
-                WHERE cs.is_error_page=0
-                  AND srm.immediately_read_distance IS NOT NULL
-            """).fetchall()]
+                WHERE cs.is_error_page=0 AND {NOT_FP}
+clear                  AND srm.immediately_read_distance IS NOT NULL
+            """).fetchall()
+            ]
 
         return {"rates": rates, "distances": distances}
     finally:
@@ -204,7 +281,7 @@ def _srm_metrics(db_path):
 def _pct(num, denom):
     if not denom:
         return "---"
-    return rf"{num/denom*100:.0f}\,\%"
+    return rf"{num / denom * 100:.0f}\,\%"
 
 
 def run(db_paths):
@@ -242,7 +319,7 @@ def run(db_paths):
     if has_reject:
         # 1 label col + 3 phase groups × n tier cols
         full_col_spec = "l" + " rrr" * n
-        phase_span    = n
+        phase_span = n
 
         print(r"\begin{table}[ht]\centering\footnotesize")
         print(
@@ -253,13 +330,11 @@ def run(db_paths):
         print(r"\toprule")
         # Phase multicolumn headers
         mc = rf"\multicolumn{{{phase_span}}}{{c}}"
-        print(
-            rf"  & {mc}{{Pre-interaction}} & {mc}{{Post-accept}} & {mc}{{Post-reject}} \\"
-        )
+        print(rf"  & {mc}{{Pre-interaction}} & {mc}{{Post-accept}} & {mc}{{Post-reject}} \\")
         # cmidrules under each phase group (cols 2..n+1, n+2..2n+1, 2n+2..3n+1)
-        c1s, c1e = 2,       n + 1
-        c2s, c2e = n + 2,   2 * n + 1
-        c3s, c3e = 2*n + 2, 3 * n + 1
+        c1s, c1e = 2, n + 1
+        c2s, c2e = n + 2, 2 * n + 1
+        c3s, c3e = 2 * n + 2, 3 * n + 1
         print(
             rf"  \cmidrule(lr){{{c1s}-{c1e}}}"
             rf"\cmidrule(lr){{{c2s}-{c2e}}}"
@@ -272,34 +347,38 @@ def run(db_paths):
         def row3(label, pre_vals, acc_vals, rej_vals):
             print(rf"  {label} & {' & '.join(pre_vals)} & {' & '.join(acc_vals)} & {' & '.join(rej_vals)} \\")
 
-        row3("Reachable sites",
-             [str(m["reachable"]) for _, _, m in data],
-             [blank3], [blank3])
-        row3("Cookie notices detected",
-             [_pct(m["detected"], m["reachable"]) for _, _, m in data],
-             [blank3], [blank3])
+        row3("Reachable sites", [str(m["reachable"]) for _, _, m in data], [blank3], [blank3])
+        row3("Cookie notices detected", [_pct(m["detected"], m["reachable"]) for _, _, m in data], [blank3], [blank3])
         print(r"  \addlinespace[3pt]")
-        row3(r"LH score",
-             [fmt(m["pre_lh"]) for _, _, m in data],
-             [fmt(m["acc_lh"]) for _, _, m in data],
-             [fmt(m["rej_lh"]) for _, _, m in data])
-        row3(r"WAVE errors",
-             [fmt(m["pre_we"]) for _, _, m in data],
-             [fmt(m["acc_we"]) for _, _, m in data],
-             [fmt(m["rej_we"]) for _, _, m in data])
-        row3(r"WAVE contrast errors",
-             [fmt(m["pre_wc"]) for _, _, m in data],
-             [fmt(m["acc_wc"]) for _, _, m in data],
-             [fmt(m["rej_wc"]) for _, _, m in data])
-        row3(r"WAVE alerts",
-             [fmt(m["pre_wa"]) for _, _, m in data],
-             [fmt(m["acc_wa"]) for _, _, m in data],
-             [fmt(m["rej_wa"]) for _, _, m in data])
+        row3(
+            r"LH score",
+            [fmt(m["pre_lh"]) for _, _, m in data],
+            [fmt(m["acc_lh"]) for _, _, m in data],
+            [fmt(m["rej_lh"]) for _, _, m in data],
+        )
+        row3(
+            r"WAVE errors",
+            [fmt(m["pre_we"]) for _, _, m in data],
+            [fmt(m["acc_we"]) for _, _, m in data],
+            [fmt(m["rej_we"]) for _, _, m in data],
+        )
+        row3(
+            r"WAVE contrast errors",
+            [fmt(m["pre_wc"]) for _, _, m in data],
+            [fmt(m["acc_wc"]) for _, _, m in data],
+            [fmt(m["rej_wc"]) for _, _, m in data],
+        )
+        row3(
+            r"WAVE alerts",
+            [fmt(m["pre_wa"]) for _, _, m in data],
+            [fmt(m["acc_wa"]) for _, _, m in data],
+            [fmt(m["rej_wa"]) for _, _, m in data],
+        )
 
     else:
         # No reject data: two phase groups only
         full_col_spec = "l" + " rr" * n
-        phase_span    = n
+        phase_span = n
 
         print(r"\begin{table}[ht]\centering\footnotesize")
         print(
@@ -310,8 +389,8 @@ def run(db_paths):
         print(r"\toprule")
         mc = rf"\multicolumn{{{phase_span}}}{{c}}"
         print(rf"  & {mc}{{Pre-interaction}} & {mc}{{Post-accept}} \\")
-        c1s, c1e = 2,       n + 1
-        c2s, c2e = n + 2,   2 * n + 1
+        c1s, c1e = 2, n + 1
+        c2s, c2e = n + 2, 2 * n + 1
         print(rf"  \cmidrule(lr){{{c1s}-{c1e}}}\cmidrule(lr){{{c2s}-{c2e}}}")
         print(rf"  Metric & {tier_header} & {tier_header} \\ \midrule")
 
@@ -320,25 +399,13 @@ def run(db_paths):
         def row2(label, pre_vals, acc_vals):
             print(rf"  {label} & {' & '.join(pre_vals)} & {' & '.join(acc_vals)} \\")
 
-        row2("Reachable sites",
-             [str(m["reachable"]) for _, _, m in data],
-             [blank2])
-        row2("Cookie notices detected",
-             [_pct(m["detected"], m["reachable"]) for _, _, m in data],
-             [blank2])
+        row2("Reachable sites", [str(m["reachable"]) for _, _, m in data], [blank2])
+        row2("Cookie notices detected", [_pct(m["detected"], m["reachable"]) for _, _, m in data], [blank2])
         print(r"  \addlinespace[3pt]")
-        row2(r"LH score",
-             [fmt(m["pre_lh"]) for _, _, m in data],
-             [fmt(m["acc_lh"]) for _, _, m in data])
-        row2(r"WAVE errors",
-             [fmt(m["pre_we"]) for _, _, m in data],
-             [fmt(m["acc_we"]) for _, _, m in data])
-        row2(r"WAVE contrast errors",
-             [fmt(m["pre_wc"]) for _, _, m in data],
-             [fmt(m["acc_wc"]) for _, _, m in data])
-        row2(r"WAVE alerts",
-             [fmt(m["pre_wa"]) for _, _, m in data],
-             [fmt(m["acc_wa"]) for _, _, m in data])
+        row2(r"LH score", [fmt(m["pre_lh"]) for _, _, m in data], [fmt(m["acc_lh"]) for _, _, m in data])
+        row2(r"WAVE errors", [fmt(m["pre_we"]) for _, _, m in data], [fmt(m["acc_we"]) for _, _, m in data])
+        row2(r"WAVE contrast errors", [fmt(m["pre_wc"]) for _, _, m in data], [fmt(m["acc_wc"]) for _, _, m in data])
+        row2(r"WAVE alerts", [fmt(m["pre_wa"]) for _, _, m in data], [fmt(m["acc_wa"]) for _, _, m in data])
 
     print(r"\bottomrule\end{tabular}")
     print(r"\end{table}")
@@ -346,36 +413,67 @@ def run(db_paths):
 
     # ── improvement / worsening table ─────────────────────────────────────────
     print(r"\begin{table}[ht]\centering\footnotesize")
-    print(r"\caption{Sites improved or worsened post-accept by Tranco stratum}\label{tab:a11y-strata-delta}")
+    print(
+        r"\caption{Sites with accessibility changes by comparison phase and Tranco stratum}\label{tab:a11y-strata-delta}"
+    )
     print(rf"\begin{{tabular}}{{{col_spec}}}")
     print(rf"\toprule Metric & {col_header} \\ \midrule")
 
-    row(r"LH improved post-accept",
-        [_pct(m["lh_improved"], m["lh_measured"]) for _, _, m in data])
-    row(r"LH declined post-accept",
-        [_pct(m["lh_declined"], m["lh_measured"]) for _, _, m in data])
+    print(rf"  \multicolumn{{{1 + len(data)}}}{{l}}{{\textit{{Pre vs.\ Accept}}}} \\")
+    row(r"\quad LH improved post-accept", [_pct(m["lh_improved"], m["lh_measured"]) for _, _, m in data])
+    row(r"\quad LH declined post-accept", [_pct(m["lh_declined"], m["lh_measured"]) for _, _, m in data])
     print(r"  \addlinespace[3pt]")
-    row(r"WAVE errors improved",
-        [_pct(m["we_improved"], m["detected"]) for _, _, m in data])
-    row(r"WAVE errors worsened",
-        [_pct(m["we_worsened"], m["detected"]) for _, _, m in data])
+    row(r"\quad WAVE errors improved post-accept", [_pct(m["we_improved"], m["detected"]) for _, _, m in data])
+    row(r"\quad WAVE errors worsened post-accept", [_pct(m["we_worsened"], m["detected"]) for _, _, m in data])
+
+    if has_reject:
+        print(r"  \addlinespace[6pt]")
+        print(rf"  \multicolumn{{{1 + len(data)}}}{{l}}{{\textit{{Pre vs.\ Reject}}}} \\")
+        row(r"\quad LH improved post-reject", [_pct(m["lh_improved_rej"], m["lh_measured_rej"]) for _, _, m in data])
+        row(r"\quad LH declined post-reject", [_pct(m["lh_declined_rej"], m["lh_measured_rej"]) for _, _, m in data])
+        print(r"  \addlinespace[3pt]")
+        row(
+            r"\quad WAVE errors improved post-reject",
+            [_pct(m["we_improved_rej"], m["detected_rej"]) for _, _, m in data],
+        )
+        row(
+            r"\quad WAVE errors worsened post-reject",
+            [_pct(m["we_worsened_rej"], m["detected_rej"]) for _, _, m in data],
+        )
+
+        print(r"  \addlinespace[6pt]")
+        print(rf"  \multicolumn{{{1 + len(data)}}}{{l}}{{\textit{{Accept vs.\ Reject}}}} \\")
+        row(
+            r"\quad LH higher post-reject than post-accept",
+            [_pct(m["lh_improved_ar"], m["lh_measured_ar"]) for _, _, m in data],
+        )
+        row(
+            r"\quad LH lower post-reject than post-accept",
+            [_pct(m["lh_declined_ar"], m["lh_measured_ar"]) for _, _, m in data],
+        )
+        print(r"  \addlinespace[3pt]")
+        row(
+            r"\quad WAVE errors lower post-reject than post-accept",
+            [_pct(m["we_improved_ar"], m["detected_ar"]) for _, _, m in data],
+        )
+        row(
+            r"\quad WAVE errors higher post-reject than post-accept",
+            [_pct(m["we_worsened_ar"], m["detected_ar"]) for _, _, m in data],
+        )
 
     print(r"\bottomrule\end{tabular}")
     print(r"\end{table}")
     print()
 
     # ── prose observations ────────────────────────────────────────────────────
-    lh_pres  = [m["pre_lh"]  or 0 for _, _, m in data]
-    lh_accs  = [m["acc_lh"]  or 0 for _, _, m in data]
-    we_pres  = [m["pre_we"]  or 0 for _, _, m in data]
+    lh_pres = [m["pre_lh"] or 0 for _, _, m in data]
+    lh_accs = [m["acc_lh"] or 0 for _, _, m in data]  # noqa: F841
+    we_pres = [m["pre_we"] or 0 for _, _, m in data]
 
-    best_lh_idx  = lh_pres.index(max(lh_pres))
-    worst_we_idx = we_pres.index(max(we_pres))
+    best_lh_idx = lh_pres.index(max(lh_pres))
+    worst_we_idx = we_pres.index(max(we_pres))  # noqa: F841
 
-    detect_pcts = [
-        m["detected"] / m["reachable"] * 100 if m["reachable"] else 0
-        for _, _, m in data
-    ]
+    detect_pcts = [m["detected"] / m["reachable"] * 100 if m["reachable"] else 0 for _, _, m in data]
 
     print(
         rf"We see a clear decline in cookie notice prevalence with lower Tranco rank: "
@@ -397,15 +495,14 @@ def run(db_paths):
     )
     print()
 
-    lh_delta = [(m["acc_lh"] or 0) - (m["pre_lh"] or 0) for _, _, m in data]
-    lh_imp   = [_pct(m["lh_improved"], m["lh_measured"]) for _, _, m in data]
-    lh_dec   = [_pct(m["lh_declined"],  m["lh_measured"]) for _, _, m in data]
-    we_imp   = [_pct(m["we_improved"],  m["detected"])    for _, _, m in data]
-    we_wor   = [_pct(m["we_worsened"],  m["detected"])    for _, _, m in data]
+    lh_delta = [(m["acc_lh"] or 0) - (m["pre_lh"] or 0) for _, _, m in data]  # noqa: F841
+    lh_imp = [_pct(m["lh_improved"], m["lh_measured"]) for _, _, m in data]
+    lh_dec = [_pct(m["lh_declined"], m["lh_measured"]) for _, _, m in data]
+    we_imp = [_pct(m["we_improved"], m["detected"]) for _, _, m in data]
+    we_wor = [_pct(m["we_worsened"], m["detected"]) for _, _, m in data]
 
     tier_parts = "; ".join(
-        rf"\emph{{{l}}}: {lh_dec[i]} declined vs.\ {lh_imp[i]} improved"
-        for i, l in enumerate(labels)
+        rf"\emph{{{l}}}: {lh_dec[i]} declined vs.\ {lh_imp[i]} improved" for i, l in enumerate(labels)
     )
     print(
         rf"Post-accept, Lighthouse scores declined on substantially more sites than they "
@@ -428,53 +525,71 @@ def run(db_paths):
     def _fmt_d(d):
         return f"+{d}" if d > 0 else str(d)
 
-    def _issue_table(kind, id_key, desc_key, caption, label, top_n=10):
-        # Collect all issue ids seen across any stratum
-        all_ids = {}  # id -> best description
+    def _issue_table(
+        kind, id_key, desc_key, caption, label, top_n=10, categories=None, delta_pair=(2, 1), phase_label="post-accept"
+    ):
+        # delta_pair=(new_idx, base_idx) into entry tuple (desc, pre, acc, rej[, cat])
+        all_ids = {}
         for _, _, m in issue_data:
-            for iid, (desc, *_) in m[kind].items():
+            for iid, entry in m[kind].items():
                 if iid not in all_ids:
-                    all_ids[iid] = desc
+                    if categories is None or (len(entry) > 4 and entry[4] in categories):
+                        all_ids[iid] = entry[0]
 
         if not all_ids:
             return
 
-        # Rank by total absolute post-accept delta across strata
+        ni, bi = delta_pair
+
         def _total_impact(iid):
             return sum(
-                abs((m[kind].get(iid, (None, 0, 0, 0))[2]) -
-                    (m[kind].get(iid, (None, 0, 0, 0))[1]))
+                abs((m[kind].get(iid, (None, 0, 0, 0))[ni]) - (m[kind].get(iid, (None, 0, 0, 0))[bi]))
                 for _, _, m in issue_data
             )
 
         ranked = sorted(all_ids, key=_total_impact, reverse=True)[:top_n]
 
         n_strata = len(issue_data)
-        col_spec = "l" + "r" * n_strata
-        col_hdr  = " & ".join(rf"\textbf{{{l}}}" for _, l, _ in issue_data)
+        has_cat = kind == "wave" and categories is not None
+        cat_abbrev = {"alert": "Al", "contrast": "Co", "error": "Er"}
+        col_spec = "l" + ("l" if has_cat else "") + "r" * n_strata
+        col_hdr = " & ".join(rf"\textbf{{{l}}}" for _, l, _ in issue_data)
+        cat_header = " & Cat." if has_cat else ""
 
         print(r"\begin{table}[ht]\centering\footnotesize")
-        print(rf"\caption{{{caption}}}\label{{{label}}}")
+        if has_cat:
+            print(rf"\caption{{{caption}. Cat.:\ Al\,=\,Alert; Co\,=\,Contrast; Er\,=\,Error.}}\label{{{label}}}")
+        else:
+            print(rf"\caption{{{caption}}}\label{{{label}}}")
         print(rf"\begin{{tabular}}{{{col_spec}}}")
-        print(rf"\toprule {desc_key} ($\Delta$ post-accept) & {col_hdr} \\ \midrule")
+        print(rf"\toprule {desc_key} ($\Delta$ {phase_label}){cat_header} & {col_hdr} \\ \midrule")
 
         for iid in ranked:
             desc = latex_escape(all_ids[iid])
+            cat_col = ""
+            if has_cat:
+                raw_cat = ""
+                for _, _, m in issue_data:
+                    entry = m[kind].get(iid)
+                    if entry and len(entry) > 4:
+                        raw_cat = entry[4]
+                        break
+                cat_col = f" & {cat_abbrev.get(raw_cat, raw_cat)}"
             deltas = []
             for _, _, m in issue_data:
                 entry = m[kind].get(iid)
-                if entry:
-                    deltas.append(_fmt_d(entry[2] - entry[1]))
+                if entry and len(entry) > max(ni, bi):
+                    deltas.append(_fmt_d(entry[ni] - entry[bi]))
                 else:
                     deltas.append("---")
-            print(rf"  {desc} & {' & '.join(deltas)} \\")
+            print(rf"  {desc}{cat_col} & {' & '.join(deltas)} \\")
 
         print(r"\bottomrule\end{tabular}")
         print(r"\end{table}")
         print()
 
     has_wave = any(m["wave"] for _, _, m in issue_data)
-    has_lh   = any(m["lh"]   for _, _, m in issue_data)
+    has_lh = any(m["lh"] for _, _, m in issue_data)
 
     if has_wave or has_lh:
         print(r"\subsubsection{WAVE and Lighthouse Issue Changes Across Strata}")
@@ -490,17 +605,66 @@ def run(db_paths):
 
         if has_wave:
             _issue_table(
-                "wave", "issue_id", "WAVE issue",
+                "wave",
+                "issue_id",
+                "WAVE issue",
                 r"Top WAVE issue changes post-accept by Tranco stratum",
                 "tab:wave-strata",
+                categories={"alert", "contrast", "error"},
             )
 
         if has_lh:
             _issue_table(
-                "lh", "audit_id", "Lighthouse audit",
+                "lh",
+                "audit_id",
+                "Lighthouse audit",
                 r"Top Lighthouse audit changes post-accept by Tranco stratum",
                 "tab:lh-strata",
             )
+
+        if has_reject:
+            if has_wave:
+                _issue_table(
+                    "wave",
+                    "issue_id",
+                    "WAVE issue",
+                    r"Top WAVE issue changes post-reject by Tranco stratum",
+                    "tab:wave-strata-rej",
+                    categories={"alert", "contrast", "error"},
+                    delta_pair=(3, 1),
+                    phase_label="post-reject",
+                )
+            if has_lh:
+                _issue_table(
+                    "lh",
+                    "audit_id",
+                    "Lighthouse audit",
+                    r"Top Lighthouse audit changes post-reject by Tranco stratum",
+                    "tab:lh-strata-rej",
+                    delta_pair=(3, 1),
+                    phase_label="post-reject",
+                )
+            if has_wave:
+                _issue_table(
+                    "wave",
+                    "issue_id",
+                    "WAVE issue",
+                    r"Top WAVE issue changes: reject vs.\ accept by Tranco stratum",
+                    "tab:wave-strata-ar",
+                    categories={"alert", "contrast", "error"},
+                    delta_pair=(3, 2),
+                    phase_label=r"reject vs.\ accept",
+                )
+            if has_lh:
+                _issue_table(
+                    "lh",
+                    "audit_id",
+                    "Lighthouse audit",
+                    r"Top Lighthouse audit changes: reject vs.\ accept by Tranco stratum",
+                    "tab:lh-strata-ar",
+                    delta_pair=(3, 2),
+                    phase_label=r"reject vs.\ accept",
+                )
 
     # ── screen reader pass rates by stratum ───────────────────────────────────
     srm_data = [(db_path, _label(db_path), _srm_metrics(db_path)) for db_path in db_paths]
@@ -527,11 +691,7 @@ def run(db_paths):
     print(rf"\toprule Metric & {srm_col_header} \\ \midrule")
 
     for col, label in _SRM_COLS:
-        vals = [
-            _pct(m["rates"].get(col, (0, 0, 0))[0],
-                 m["rates"].get(col, (0, 0, 0))[2])
-            for _, _, m in srm_data
-        ]
+        vals = [_pct(m["rates"].get(col, (0, 0, 0))[0], m["rates"].get(col, (0, 0, 0))[2]) for _, _, m in srm_data]
         row(label, vals)
 
     print(r"\bottomrule\end{tabular}")
@@ -557,10 +717,7 @@ def run(db_paths):
             row(bucket_label, vals)
 
         print(r"  \addlinespace[3pt]")
-        pass_vals = [
-            _pct(sum(1 for d in dists if d <= 30), len(dists))
-            for _, dists in dist_data
-        ]
+        pass_vals = [_pct(sum(1 for d in dists if d <= 30), len(dists)) for _, dists in dist_data]
         row(r"\textbf{Pass ($\leq 30$ words)}", pass_vals)
 
         print(r"\bottomrule\end{tabular}")
@@ -570,16 +727,15 @@ def run(db_paths):
         # prose: which stratum has the best pass rate for immediately read
         ir_col = "metric_immediately_read"
         ir_rates = [
-            m["rates"].get(ir_col, (0, 0, 0))[0] /
-            m["rates"].get(ir_col, (0, 0, 0))[2] * 100
-            if m["rates"].get(ir_col, (0, 0, 0))[2] else 0
+            m["rates"].get(ir_col, (0, 0, 0))[0] / m["rates"].get(ir_col, (0, 0, 0))[2] * 100
+            if m["rates"].get(ir_col, (0, 0, 0))[2]
+            else 0
             for _, _, m in srm_data
         ]
-        best_ir_idx  = ir_rates.index(max(ir_rates))
+        best_ir_idx = ir_rates.index(max(ir_rates))
         worst_ir_idx = ir_rates.index(min(ir_rates))
         dist_pass = [
-            sum(1 for d in m["distances"] if d <= 30) / len(m["distances"]) * 100
-            if m["distances"] else 0
+            sum(1 for d in m["distances"] if d <= 30) / len(m["distances"]) * 100 if m["distances"] else 0
             for _, _, m in srm_data
         ]
         if len(srm_data) >= 3:
@@ -609,6 +765,7 @@ def run(db_paths):
 
 if __name__ == "__main__":
     from pathlib import Path as _Path
+
     base = _Path(__file__).parent.parent
     names = sys.argv[1:] if len(sys.argv) > 1 else DEFAULT_DBS
     db_paths = [base / n for n in names if (base / n).exists()]

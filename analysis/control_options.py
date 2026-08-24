@@ -1,7 +1,7 @@
 import sqlite3
 import sys
 
-from .utils import q, latex_escape, NOT_FP, DB_PATH
+from .utils import NOT_FP, latex_escape, q
 
 _CTRL_TYPE_SQL = (
     "SELECT DISTINCT url FROM chrome_scans "
@@ -40,20 +40,32 @@ def run(conn, db_paths=None):
 
     total = sum(cnt for _, _, cnt in ct_rows) + no_notice_chrome
 
+    compliant_ctrls = {"accept_or_reject", "accept_reject_or_settings"}
+    notice_total = sum(cnt for _, _, cnt in ct_rows)
+    gdpr_compliant = sum(cnt for ctrl, _, cnt in ct_rows if ctrl in compliant_ctrls)
+    gdpr_violating = notice_total - gdpr_compliant
+
     print(r"\subsection{Cookie Notice Control Options and GDPR}")
     print(
         r"Table~\ref{tab:options} classifies all reachable sites by the control options "
         r"offered to visitors, using the taxonomy from the paper. "
         r"The \textbf{GDPR violation} column indicates whether the notice design "
         r"satisfies the GDPR requirement for freely given, unambiguous consent: "
-        r"notices that offer no explicit reject path are considered non-compliant."
+        r"notices that offer no explicit reject path are considered non-compliant. "
+        rf"Of the {notice_total} sites that displayed a cookie notice, "
+        rf"{gdpr_compliant} ({gdpr_compliant / notice_total * 100:.0f}\,\%) are GDPR compliant "
+        rf"and {gdpr_violating} ({gdpr_violating / notice_total * 100:.0f}\,\%) violate GDPR. "
+        rf"A further {no_notice_chrome} sites ({no_notice_chrome / total * 100:.0f}\,\%) "
+        r"displayed no cookie notice at all, which also constitutes a GDPR violation."
     )
     print()
 
     print(r"\begin{table*}[t]\centering\footnotesize")
     print(r"\caption{Cookie notice control options and GDPR compliance.}\label{tab:options}")
     print(r"\begin{tabular}{llrrr} \toprule")
-    print(r"  \textbf{Control options} & \textbf{Emphasised option} & \textbf{Sites} & \textbf{\%} & \textbf{GDPR violation} \\ \midrule")
+    print(
+        r"  \textbf{Control options} & \textbf{Emphasised option} & \textbf{Sites} & \textbf{\%} & \textbf{GDPR violation} \\ \midrule"
+    )
     sorted_ct_rows = sorted(
         ct_rows,
         key=lambda row: (-row[2], str(row[0] or ""), str(row[1] or "")),
@@ -62,8 +74,10 @@ def run(conn, db_paths=None):
         ctrl_label = latex_escape(ctrl if ctrl is not None else "unknown")
         emph_label = latex_escape(emph if emph is not None else "unknown")
         gdpr_violation = "No" if ctrl in ("accept_or_reject", "accept_reject_or_settings") else "Yes"
-        print(rf"  {ctrl_label} & {emph_label} & {cnt} & {cnt/total*100:.0f}\,\% & {gdpr_violation} \\")
-    print(rf"  \multicolumn{{2}}{{l}}{{(v) No Notice}} & {no_notice_chrome} & {no_notice_chrome/total*100:.0f}\,\% & Yes \\")
+        print(rf"  {ctrl_label} & {emph_label} & {cnt} & {cnt / total * 100:.0f}\,\% & {gdpr_violation} \\")
+    print(
+        rf"  \multicolumn{{2}}{{l}}{{(v) No Notice}} & {no_notice_chrome} & {no_notice_chrome / total * 100:.0f}\,\% & Yes \\"
+    )
     print(r"  \bottomrule\end{tabular}")
     print(r"\end{table*}")
 
@@ -84,7 +98,9 @@ def run(conn, db_paths=None):
 
 if __name__ == "__main__":
     import sys
+
     from .utils import open_merged
+
     db_names = sys.argv[1:] if len(sys.argv) > 1 else None
     conn, db_paths = open_merged(db_names)
     try:

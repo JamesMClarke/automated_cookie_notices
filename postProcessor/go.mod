@@ -1,4 +1,4 @@
-module postProcessor/main
+module postProcessor/postProcessor
 
 go 1.26.2
 

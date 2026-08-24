@@ -4,7 +4,7 @@ mark_verified.py
 Set the manually_verified flag on a chrome_scans row.
 
 Usage:
-    python mark_verified.py top-100.db <scan_id> <1|0|NULL>
+    python reviewing/mark_verified.py top-100.db <scan_id> <1|0|NULL>
 
     1    = manually confirmed the cookie notice was accepted
     0    = manually confirmed it was NOT accepted
@@ -23,7 +23,7 @@ def main():
         print(__doc__)
         sys.exit(1)
 
-    db_path  = sys.argv[1]
+    db_path = sys.argv[1]
     try:
         scan_id = int(sys.argv[2])
     except ValueError:
@@ -43,8 +43,7 @@ def main():
 
     con = sqlite3.connect(db_path)
     row = con.execute(
-        "SELECT url, cookie_notice_accepted, cookie_accept_attempted "
-        "FROM chrome_scans WHERE id=?", (scan_id,)
+        "SELECT url, cookie_notice_accepted, cookie_accept_attempted FROM chrome_scans WHERE id=?", (scan_id,)
     ).fetchone()
 
     if row is None:
@@ -54,11 +53,15 @@ def main():
 
     url, accepted, attempted = row
     if accepted:
-        print(f"[!] Scan {scan_id} ({url}) was already auto-confirmed accepted — "
-              "manually_verified is not needed but will be set anyway.")
+        print(
+            f"[!] Scan {scan_id} ({url}) was already auto-confirmed accepted — "
+            "manually_verified is not needed but will be set anyway."
+        )
     if not attempted:
-        print(f"[!] Scan {scan_id} ({url}) had no click attempted — "
-              "setting manually_verified will have no effect on analysis.")
+        print(
+            f"[!] Scan {scan_id} ({url}) had no click attempted — "
+            "setting manually_verified will have no effect on analysis."
+        )
 
     con.execute("UPDATE chrome_scans SET manually_verified=? WHERE id=?", (value, scan_id))
     con.commit()

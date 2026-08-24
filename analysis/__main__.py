@@ -6,11 +6,13 @@ Usage:
     python -m analysis top-1000.sqlite              # single DB
     python -m analysis crawl_two.sqlite crawl_three.sqlite
 """
+
 import sys
 
 from . import (
     accessibility,
     accessibility_issues,
+    button_wording,
     control_options,
     cookie_notices,
     cookies,
@@ -30,6 +32,7 @@ def main():
         overview.run(conn)
         errors.run(conn, db_paths=db_paths)
         cookie_notices.run(conn, db_paths=db_paths)
+        button_wording.run(conn)
         trackers.run(conn)
         cookies.run(conn)
         accessibility.run(conn)

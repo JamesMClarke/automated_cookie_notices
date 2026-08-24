@@ -31,7 +31,9 @@ const (
 	// Cookiedatabase.org REST API (no auth required for public endpoint)
 	cdbCookiesURL = "https://cookiedatabase.org/wp-json/cookiedatabase/v1/cookies/"
 	cdbBatchSize  = 50
-	cdbDelay      = 200 * time.Millisecond
+	cdbDelay      = 1 * time.Second
+	cdbMaxRetries = 3
+	cdbRetryDelay = 2 * time.Second
 
 	// CookieSearch (cookiesearch.org) by CookieYes claims 100k+ cookies but
 	// provides no REST API or downloadable dataset — web UI only, not usable here.
@@ -98,6 +100,9 @@ func main() {
 	}
 	classifyCookies(dbPath, artifactPath, lookup, *reclassify)
 	classifyStorage(dbPath, artifactPath, lookup, *reclassify)
+	processWaveDetails(dbPath, artifactPath, *reclassify)
+	processLighthouseIssues(dbPath, artifactPath, *reclassify)
+	evaluateScreenReaderMetrics(dbPath, artifactPath, *reclassify)
 }
 
 type ruleEntry struct {
@@ -317,18 +322,21 @@ func identifyTrackers(matcher *adblock.RuleMatcher, ruleInfo map[int]ruleEntry, 
 			for r := range jobs {
 				parsed, err := url.Parse(r.raw)
 				if err != nil {
-					fmt.Printf("Error parsing URL %s: %v\n", r.raw, err)
-					continue
+					// URLs may contain unresolved ad macros (e.g. %%MACRO%%) which are
+					// invalid percent-encoding. Strip them just for hostname extraction.
+					parsed, err = url.Parse(strings.ReplaceAll(r.raw, "%%", ""))
+					if err != nil {
+						fmt.Printf("Error parsing URL %s: %v\n", r.raw, err)
+						continue
+					}
 				}
 				req := &adblock.Request{URL: r.raw, Domain: parsed.Hostname()}
-				matched, ruleId, err := matcher.Match(req)
+				matched, _, err := matcher.Match(req)
 				if err != nil {
 					fmt.Printf("Error matching URL %s: %v\n", r.raw, err)
 					continue
 				}
 				if matched {
-					info := ruleInfo[ruleId]
-					fmt.Printf("Tracker: %s\n  matched rule: %q\n  from file:    %s\n", r.raw, info.raw, info.file)
 					trackers.Add(1)
 				}
 				results <- updateRecord{id: r.id, isTracker: matched}
@@ -350,12 +358,37 @@ func identifyTrackers(matcher *adblock.RuleMatcher, ruleInfo map[int]ruleEntry, 
 		close(jobs)
 	}()
 
-	// Single writer goroutine keeps SQLite writes serialised
+	// Single writer goroutine keeps SQLite writes serialised inside one transaction
+	tx, err := db.Begin()
+	if err != nil {
+		fmt.Println("Error starting transaction:", err)
+		return
+	}
+	txStmt, err := tx.Prepare("UPDATE chrome_network_requests SET is_tracker = ? WHERE id = ?")
+	if err != nil {
+		fmt.Println("Error preparing statement:", err)
+		tx.Rollback()
+		return
+	}
+	total := len(records)
+	processed := 0
+	printStep := total / 10
+	if printStep < 1 {
+		printStep = 1
+	}
 	for u := range results {
-		_, err = db.Exec("UPDATE chrome_network_requests SET is_tracker = ? WHERE id = ?", u.isTracker, u.id)
-		if err != nil {
+		if _, err = txStmt.Exec(u.isTracker, u.id); err != nil {
 			fmt.Printf("Error updating row %d: %v\n", u.id, err)
 		}
+		processed++
+		if processed%printStep == 0 || processed == total {
+			fmt.Printf("  [trackers] %d/%d URLs classified (%d%%, %d trackers so far)\n",
+				processed, total, processed*100/total, trackers.Load())
+		}
+	}
+	txStmt.Close()
+	if err = tx.Commit(); err != nil {
+		fmt.Println("Error committing transaction:", err)
 	}
 
 	fmt.Printf("Finished processing URLs. Trackers found: %d\n", trackers.Load())
@@ -501,13 +534,18 @@ func resolveArtifactPath(stored, artifactPath string) string {
 	// Normalise separators so we can split on "/" consistently.
 	norm := strings.ReplaceAll(stored, "\\", "/")
 	parts := strings.Split(norm, "/")
+	// Look for either "artifacts" or the basename of artifactPath as the pivot.
+	pivots := []string{"artifacts", strings.ToLower(filepath.Base(artifactPath))}
 	for i, p := range parts {
-		if strings.EqualFold(p, "artifacts") {
-			rel := filepath.Join(parts[i+1:]...)
-			return filepath.Join(artifactPath, rel)
+		lower := strings.ToLower(p)
+		for _, pivot := range pivots {
+			if lower == pivot {
+				rel := filepath.Join(parts[i+1:]...)
+				return filepath.Join(artifactPath, rel)
+			}
 		}
 	}
-	// No artifacts component found — use as-is.
+	// No pivot found — use as-is.
 	if filepath.IsAbs(stored) {
 		return stored
 	}
@@ -710,9 +748,9 @@ func enrichFromCDB(db *sql.DB) {
 			end = len(unknowns)
 		}
 		batch := unknowns[i:end]
-		results, err := queryCDB(batch)
+		results, err := queryCDBWithRetry(batch)
 		if err != nil {
-			fmt.Printf("[cdb] Warning: batch %d–%d failed: %v\n", i+1, end, err)
+			fmt.Printf("[cdb] Warning: batch %d–%d failed after %d retries: %v\n", i+1, end, cdbMaxRetries, err)
 		} else {
 			for k, v := range results {
 				found[k] = v
@@ -859,11 +897,322 @@ func queryCDB(names []string) (map[string]*cdbResult, error) {
 	return results, nil
 }
 
+func queryCDBWithRetry(names []string) (map[string]*cdbResult, error) {
+	var lastErr error
+	delay := cdbRetryDelay
+	for attempt := 0; attempt <= cdbMaxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(delay)
+			delay *= 2
+		}
+		results, err := queryCDB(names)
+		if err == nil {
+			return results, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 func nullStr(s string) interface{} {
 	if s == "" {
 		return nil
 	}
 	return s
+}
+
+// ---------------------------------------------------------------------------
+// WAVE detailed issue extraction
+// ---------------------------------------------------------------------------
+
+type waveItem struct {
+	ID          string          `json:"id"`
+	Description string          `json:"description"`
+	Count       int             `json:"count"`
+	XPaths      json.RawMessage `json:"xpaths"`
+	Selectors   json.RawMessage `json:"selectors"`
+}
+
+type waveCategory struct {
+	Items map[string]waveItem `json:"items"`
+}
+
+type waveReport struct {
+	Categories map[string]waveCategory `json:"categories"`
+}
+
+func processWaveDetails(dbPath, artifactPath string, reclassify bool) {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		fmt.Printf("[wave] Error opening database: %v\n", err)
+		return
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS wave_issues (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		scan_id     INTEGER NOT NULL REFERENCES chrome_scans(id),
+		phase       TEXT    NOT NULL CHECK(phase IN ('pre','post_accept','post_reject')),
+		category    TEXT    NOT NULL,
+		issue_id    TEXT    NOT NULL,
+		description TEXT,
+		count       INTEGER,
+		xpaths      TEXT,
+		selectors   TEXT
+	)`)
+	if err != nil {
+		fmt.Printf("[wave] Error creating wave_issues table: %v\n", err)
+		return
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_wi_scan_id ON wave_issues(scan_id)`)
+	if err != nil {
+		fmt.Printf("[wave] Error creating index: %v\n", err)
+		return
+	}
+
+	if reclassify {
+		if _, err := db.Exec(`DELETE FROM wave_issues`); err != nil {
+			fmt.Printf("[wave] Error clearing wave_issues: %v\n", err)
+			return
+		}
+		fmt.Println("[wave] Cleared existing wave issues for full re-run.")
+	}
+
+	rows, err := db.Query(`
+		SELECT cs.id, cs.pre_wave_path, cs.post_accept_wave_path, cs.post_reject_wave_path
+		FROM chrome_scans cs
+		LEFT JOIN (SELECT DISTINCT scan_id FROM wave_issues) wi ON cs.id = wi.scan_id
+		WHERE wi.scan_id IS NULL
+		ORDER BY cs.id`)
+	if err != nil {
+		fmt.Printf("[wave] Error querying chrome_scans: %v\n", err)
+		return
+	}
+
+	type waveScanRow struct {
+		id             int
+		prePath        sql.NullString
+		postAcceptPath sql.NullString
+		postRejectPath sql.NullString
+	}
+	var scans []waveScanRow
+	for rows.Next() {
+		var s waveScanRow
+		if err := rows.Scan(&s.id, &s.prePath, &s.postAcceptPath, &s.postRejectPath); err != nil {
+			fmt.Printf("[wave] Error scanning row: %v\n", err)
+			continue
+		}
+		scans = append(scans, s)
+	}
+	rows.Close()
+
+	if len(scans) == 0 {
+		fmt.Println("[wave] Nothing to process.")
+		return
+	}
+	fmt.Printf("[wave] Processing %d scan(s)…\n", len(scans))
+
+	wavePhases := []struct {
+		name string
+		fn   func(waveScanRow) sql.NullString
+	}{
+		{"pre", func(s waveScanRow) sql.NullString { return s.prePath }},
+		{"post_accept", func(s waveScanRow) sql.NullString { return s.postAcceptPath }},
+		{"post_reject", func(s waveScanRow) sql.NullString { return s.postRejectPath }},
+	}
+
+	stmt, err := db.Prepare(`INSERT INTO wave_issues
+		(scan_id, phase, category, issue_id, description, count, xpaths, selectors)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		fmt.Printf("[wave] Error preparing insert: %v\n", err)
+		return
+	}
+	defer stmt.Close()
+
+	total := 0
+	for i, s := range scans {
+		for _, ph := range wavePhases {
+			p := ph.fn(s)
+			if !p.Valid || p.String == "" {
+				continue
+			}
+			wavePath := resolveArtifactPath(p.String, artifactPath)
+			data, err := os.ReadFile(wavePath)
+			if err != nil {
+				continue
+			}
+			var report waveReport
+			if err := json.Unmarshal(data, &report); err != nil {
+				fmt.Printf("[wave] Warning: could not parse %s: %v\n", wavePath, err)
+				continue
+			}
+			for catName, cat := range report.Categories {
+				for issueID, item := range cat.Items {
+					if _, err := stmt.Exec(s.id, ph.name, catName, issueID,
+						nullStr(item.Description), item.Count,
+						nullStr(string(item.XPaths)), nullStr(string(item.Selectors))); err != nil {
+						fmt.Printf("[wave] Error inserting record: %v\n", err)
+						continue
+					}
+					total++
+				}
+			}
+		}
+		if (i+1)%10 == 0 || i+1 == len(scans) {
+			fmt.Printf("  [wave] [%d/%d] %d issue records written\n", i+1, len(scans), total)
+		}
+	}
+	fmt.Printf("[wave] Done. %d wave issue records written.\n", total)
+}
+
+// ---------------------------------------------------------------------------
+// Lighthouse detailed issue extraction
+// ---------------------------------------------------------------------------
+
+type lhAuditDetails struct {
+	Items []json.RawMessage `json:"items"`
+}
+
+type lhAudit struct {
+	ID               string          `json:"id"`
+	Title            string          `json:"title"`
+	Score            *float64        `json:"score"`
+	ScoreDisplayMode string          `json:"scoreDisplayMode"`
+	Details          *lhAuditDetails `json:"details"`
+}
+
+type lhReport struct {
+	Audits map[string]lhAudit `json:"audits"`
+}
+
+func processLighthouseIssues(dbPath, artifactPath string, reclassify bool) {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		fmt.Printf("[lh] Error opening database: %v\n", err)
+		return
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS lighthouse_issues (
+		id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+		scan_id            INTEGER NOT NULL REFERENCES chrome_scans(id),
+		phase              TEXT    NOT NULL CHECK(phase IN ('pre','post_accept','post_reject')),
+		audit_id           TEXT    NOT NULL,
+		title              TEXT,
+		score              REAL,
+		score_display_mode TEXT,
+		items              TEXT
+	)`)
+	if err != nil {
+		fmt.Printf("[lh] Error creating lighthouse_issues table: %v\n", err)
+		return
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_lhi_scan_id ON lighthouse_issues(scan_id)`)
+	if err != nil {
+		fmt.Printf("[lh] Error creating index: %v\n", err)
+		return
+	}
+
+	if reclassify {
+		if _, err := db.Exec(`DELETE FROM lighthouse_issues`); err != nil {
+			fmt.Printf("[lh] Error clearing lighthouse_issues: %v\n", err)
+			return
+		}
+		fmt.Println("[lh] Cleared existing lighthouse issues for full re-run.")
+	}
+
+	rows, err := db.Query(`
+		SELECT cs.id, cs.pre_lh_path, cs.post_accept_lh_path, cs.post_reject_lh_path
+		FROM chrome_scans cs
+		LEFT JOIN (SELECT DISTINCT scan_id FROM lighthouse_issues) lhi ON cs.id = lhi.scan_id
+		WHERE lhi.scan_id IS NULL
+		ORDER BY cs.id`)
+	if err != nil {
+		fmt.Printf("[lh] Error querying chrome_scans: %v\n", err)
+		return
+	}
+
+	type lhScanRow struct {
+		id             int
+		prePath        sql.NullString
+		postAcceptPath sql.NullString
+		postRejectPath sql.NullString
+	}
+	var scans []lhScanRow
+	for rows.Next() {
+		var s lhScanRow
+		if err := rows.Scan(&s.id, &s.prePath, &s.postAcceptPath, &s.postRejectPath); err != nil {
+			fmt.Printf("[lh] Error scanning row: %v\n", err)
+			continue
+		}
+		scans = append(scans, s)
+	}
+	rows.Close()
+
+	if len(scans) == 0 {
+		fmt.Println("[lh] Nothing to process.")
+		return
+	}
+	fmt.Printf("[lh] Processing %d scan(s)…\n", len(scans))
+
+	lhPhases := []struct {
+		name string
+		fn   func(lhScanRow) sql.NullString
+	}{
+		{"pre", func(s lhScanRow) sql.NullString { return s.prePath }},
+		{"post_accept", func(s lhScanRow) sql.NullString { return s.postAcceptPath }},
+		{"post_reject", func(s lhScanRow) sql.NullString { return s.postRejectPath }},
+	}
+
+	stmt, err := db.Prepare(`INSERT INTO lighthouse_issues
+		(scan_id, phase, audit_id, title, score, score_display_mode, items)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		fmt.Printf("[lh] Error preparing insert: %v\n", err)
+		return
+	}
+	defer stmt.Close()
+
+	total := 0
+	for i, s := range scans {
+		for _, ph := range lhPhases {
+			p := ph.fn(s)
+			if !p.Valid || p.String == "" {
+				continue
+			}
+			lhPath := resolveArtifactPath(p.String, artifactPath)
+			data, err := os.ReadFile(lhPath)
+			if err != nil {
+				continue
+			}
+			var report lhReport
+			if err := json.Unmarshal(data, &report); err != nil {
+				fmt.Printf("[lh] Warning: could not parse %s: %v\n", lhPath, err)
+				continue
+			}
+			for _, audit := range report.Audits {
+				if audit.Score == nil || *audit.Score >= 1.0 || audit.ScoreDisplayMode == "notApplicable" {
+					continue
+				}
+				var itemsJSON string
+				if audit.Details != nil && len(audit.Details.Items) > 0 {
+					b, _ := json.Marshal(audit.Details.Items)
+					itemsJSON = string(b)
+				}
+				if _, err := stmt.Exec(s.id, ph.name, audit.ID, nullStr(audit.Title),
+					*audit.Score, nullStr(audit.ScoreDisplayMode), nullStr(itemsJSON)); err != nil {
+					fmt.Printf("[lh] Error inserting record: %v\n", err)
+					continue
+				}
+				total++
+			}
+		}
+		if (i+1)%10 == 0 || i+1 == len(scans) {
+			fmt.Printf("  [lh] [%d/%d] %d audit records written\n", i+1, len(scans), total)
+		}
+	}
+	fmt.Printf("[lh] Done. %d lighthouse issue records written.\n", total)
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,9 +1402,9 @@ func enrichStorageFromCDB(db *sql.DB) {
 		if end > len(unknowns) {
 			end = len(unknowns)
 		}
-		results, err := queryCDB(unknowns[i:end])
+		results, err := queryCDBWithRetry(unknowns[i:end])
 		if err != nil {
-			fmt.Printf("[storage-cdb] Warning: batch %d–%d failed: %v\n", i+1, end, err)
+			fmt.Printf("[storage-cdb] Warning: batch %d–%d failed after %d retries: %v\n", i+1, end, cdbMaxRetries, err)
 		} else {
 			for k, v := range results {
 				found[k] = v

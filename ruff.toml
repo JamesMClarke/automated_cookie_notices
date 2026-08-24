@@ -1,0 +1,16 @@
+target-version = "py312"
+line-length = 120
+
+extend-exclude = [
+    ".venv",
+    "nvda_addon",
+    "testing",
+]
+
+[lint]
+select = ["E", "F", "I", "W"]
+# E501 (line too long): ruff-format already wraps what it safely can; the
+# rest is long f-strings/HTML templates that shouldn't be force-wrapped.
+# E741 (ambiguous name l/I/O): pre-existing short comprehension vars, low value to chase.
+# E402 (import not at top): several scripts set platform constants before importing.
+ignore = ["E501", "E741", "E402"]
